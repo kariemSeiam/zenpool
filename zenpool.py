@@ -21,7 +21,7 @@ from hashlib import sha256
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-VERSION = "2.1.9"
+VERSION = "2.1.10"
 DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "https://srv880434.hstgr.cloud")
 HUB_PORT = int(os.environ.get("ZENPOOL_PORT", 5051))
 NODE_PORT = int(os.environ.get("ZENPOOL_NODE_PORT", 5052))

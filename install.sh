@@ -22,8 +22,10 @@ MUTED='\033[38;2;90;100;128m'
 
 # ─── Config ──────────────────────────────────────────────────────────
 REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
+CDN="https://cdn.jsdelivr.net/gh/kariemSeiam/zenpool"
+COMMIT="6905e07"
 DEFAULT_HUB="https://srv880434.hstgr.cloud"
-VERSION="2.1.9"
+VERSION="2.1.10"
 MODE="node"
 KEY=""
 PUBLIC_URL=""
@@ -199,14 +201,19 @@ set_paths() {
 
 # ─── Download ────────────────────────────────────────────────────────
 download_script() {
-    local dest="$1"
-    local url="$REPO/zenpool.py?v=$VERSION"
-    if command -v curl &>/dev/null; then
-        curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$dest"
-    elif command -v wget &>/dev/null; then
-        wget -q --tries=3 "$url" -O "$dest"
-    else
-        error "Need curl or wget"; exit 1
+    local dest="$1" url got
+    for url in "$CDN@${COMMIT}/zenpool.py" "$REPO/zenpool.py?v=$VERSION"; do
+        if command -v curl &>/dev/null; then
+            curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$dest" && break
+        elif command -v wget &>/dev/null; then
+            wget -q --tries=3 "$url" -O "$dest" && break
+        else
+            error "Need curl or wget"; exit 1
+        fi
+    done
+    got="$(grep -m1 '^VERSION' "$dest" 2>/dev/null || true)"
+    if [[ "$got" != *"$VERSION"* ]]; then
+        warn "Downloaded $got (wanted $VERSION) — continuing anyway"
     fi
     chmod +x "$dest"
 }
