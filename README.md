@@ -45,7 +45,28 @@ If hub dies, nodes with `--key` keep working independently.
 
 ## Quick Start
 
-### Hub (key manager)
+### 🚀 One-command install (systemd)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/main/install.sh | bash
+```
+
+This installs the hub at `/opt/zenpool/` as a systemd service (`zenpool-hub`), auto-starts on boot.
+
+```bash
+# Check status
+systemctl status zenpool-hub
+
+# Add keys
+curl -X POST http://localhost:5051/keys \
+  -H "Content-Type: application/json" \
+  -d '{"key": "sk-...", "label": "acc-1"}'
+
+# View logs
+journalctl -u zenpool-hub -f
+```
+
+### Manual run (hub)
 
 ```bash
 python3 zenpool.py hub

@@ -1,0 +1,17 @@
+[Unit]
+Description=ZenPool Hub — distributed key proxy for OpenCode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/zenpool/zenpool.py hub
+WorkingDirectory=/opt/zenpool
+Restart=always
+RestartSec=5
+User=root
+Environment=ZENPOOL_PORT=5051
+Environment=ZENPOOL_DATA=/opt/zenpool/zenpool-data.json
+
+[Install]
+WantedBy=multi-user.target

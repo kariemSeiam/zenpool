@@ -169,6 +169,14 @@ def run_hub():
             p = self.path.split("?")[0]
             if p == "/health":
                 self._s({"ok": True, "host": platform.node(), "keys": len(pool.keys), "nodes": len(pool.nodes)})
+            elif p == "/v1/models":
+                self._s({"object": "list", "data": [
+                    {"id": "big-pickle", "object": "model", "owned_by": "opencode"},
+                    {"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "opencode"},
+                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "opencode"},
+                    {"id": "nemotron-3-super-free", "object": "model", "owned_by": "opencode"},
+                    {"id": "mimo-v2.5-free", "object": "model", "owned_by": "opencode"},
+                ]})
             elif p == "/keys":
                 self._s({"keys": pool.list_keys()})
             elif p == "/nodes":

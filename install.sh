@@ -1,26 +1,32 @@
-#!/bin/sh
-# ZenPool — distributed key proxy for OpenCode Zen
-# Usage: curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/main/install.sh | sh
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/main"
+DEST="/opt/zenpool"
 
-echo "  🐍 ZenPool — installing..."
+echo "  🐍 Installing ZenPool Hub..."
 
-URL="https://raw.githubusercontent.com/kariemSeiam/zenpool/main/zenpool.py"
-DEST="${ZENPOOL_DEST:-/usr/local/bin/zenpool}"
+# Create directory
+mkdir -p "$DEST"
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$DEST"
-elif command -v wget >/dev/null 2>&1; then
-    wget -q "$URL" -O "$DEST"
-else
-    echo "  ❌ Need curl or wget"
-    exit 1
-fi
+# Download files
+curl -fsSL "$REPO/zenpool.py" -o "$DEST/zenpool.py"
+chmod +x "$DEST/zenpool.py"
 
-chmod +x "$DEST"
-echo "  ✅ Installed to $DEST"
-echo
-echo "  Run:  zenpool hub"
-echo "  Or:   zenpool node --hub http://host:5051"
-echo "  Or:   zenpool node --key sk-xxxxx"
+# Install systemd service
+curl -fsSL "$REPO/zenpool-hub.service" -o /etc/systemd/system/zenpool-hub.service
+chmod 644 /etc/systemd/system/zenpool-hub.service
+
+# Reload systemd, enable and start
+systemctl daemon-reload
+systemctl enable zenpool-hub
+systemctl restart zenpool-hub
+
+echo "  ✅ ZenPool Hub installed at $DEST"
+echo "  ├─ Service: zenpool-hub"
+echo "  ├─ Port: 5051"
+echo "  └─ Logs: journalctl -u zenpool-hub -f"
+echo ""
+echo "  Add keys: curl -X POST http://localhost:5051/keys \\"
+echo "    -H 'Content-Type: application/json' \\"
+echo "    -d '{\"key\":\"sk-xxx\",\"label\":\"my-key\"}'"
