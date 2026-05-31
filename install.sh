@@ -23,7 +23,7 @@ MUTED='\033[38;2;90;100;128m'
 # ─── Config ──────────────────────────────────────────────────────────
 REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
 DEFAULT_HUB="http://srv880434.hstgr.cloud:5051"
-VERSION="2.1.4"
+VERSION="2.1.5"
 MODE="node"
 KEY=""
 PUBLIC_URL=""
@@ -181,6 +181,44 @@ download_script() {
 }
 
 # ─── Service installers ──────────────────────────────────────────────
+setup_user_systemd_env() {
+    local uid
+    uid="$(id -u)"
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+        return 0
+    fi
+    if [[ -d "/run/user/$uid" ]]; then
+        export XDG_RUNTIME_DIR="/run/user/$uid"
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+        return 0
+    fi
+    # Headless SSH / su — enable linger and wake user manager
+    if command -v loginctl &>/dev/null; then
+        if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+            info "Enabling linger for $USER (needed for headless install)..."
+            loginctl enable-linger "$USER" 2>/dev/null || \
+                sudo loginctl enable-linger "$USER" 2>/dev/null || true
+        fi
+    fi
+    if command -v systemctl &>/dev/null; then
+        systemctl start "user@${uid}.service" 2>/dev/null || \
+            sudo systemctl start "user@${uid}.service" 2>/dev/null || true
+    fi
+    sleep 2
+    if [[ -d "/run/user/$uid" ]]; then
+        export XDG_RUNTIME_DIR="/run/user/$uid"
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+        return 0
+    fi
+    return 1
+}
+
+user_systemctl() {
+    setup_user_systemd_env || return 1
+    systemctl --user "$@"
+}
+
 install_systemd_node() {
     local svc_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$svc_dir"
@@ -206,18 +244,22 @@ NoNewPrivileges=true
 [Install]
 WantedBy=default.target
 EOSERVICE
-    systemctl --user daemon-reload
-    systemctl --user enable --now zenpool-node.service
 
-    # Linger so service survives logout
-    if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
-        info "Enabling linger for $USER (survives logout)..."
-        # Try without sudo first, fall back
-        loginctl enable-linger "$USER" 2>/dev/null || \
-            sudo loginctl enable-linger "$USER" 2>/dev/null || \
-            warn "Could not enable linger — service runs only while logged in"
+    if user_systemctl daemon-reload && user_systemctl enable --now zenpool-node.service; then
+        if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+            loginctl enable-linger "$USER" 2>/dev/null || \
+                sudo loginctl enable-linger "$USER" 2>/dev/null || \
+                warn "Could not enable linger — service runs only while logged in"
+        fi
+        success "Node service installed (zenpool-node)"
+        return 0
     fi
-    success "Node service installed (zenpool-node)"
+
+    warn "User systemd unavailable (no D-Bus session) — using background runner"
+    install_generic_bg
+    warn "For a proper service, either:"
+    warn "  su - $USER -c 'curl -fsSL $REPO/install.sh | bash'"
+    warn "  or: sudo loginctl enable-linger $USER && systemctl --user enable --now zenpool-node"
 }
 
 install_systemd_hub() {
@@ -346,8 +388,14 @@ install_generic_bg() {
     [[ -f "$rc_file" ]] || rc_file="$HOME/.bashrc"
     [[ -f "$rc_file" ]] || rc_file="$HOME/.profile"
 
-    local cmd="nohup python3 $INSTALL_DIR/zenpool.py node --hub $HUB ${KEY:+--key $KEY} > $INSTALL_DIR/zenpool.log 2>&1 &"
-    if ! grep -q "zenpool" "$rc_file" 2>/dev/null; then
+    local cmd="nohup python3 $INSTALL_DIR/zenpool.py node --hub $HUB ${KEY:+--key $KEY} ${PUBLIC_URL:+--public-url $PUBLIC_URL} >> $INSTALL_DIR/zenpool.log 2>&1 &"
+    if ! pgrep -u "$(id -u)" -f "zenpool.py.*node.*$HUB" >/dev/null 2>&1; then
+        eval "$cmd"
+        success "Started zenpool node in background (see $INSTALL_DIR/zenpool.log)"
+    else
+        success "Zenpool node already running"
+    fi
+    if ! grep -q "zenpool.py.*node" "$rc_file" 2>/dev/null; then
         cat >> "$rc_file" << EORC
 
 # 🐍 ZenPool node — background
@@ -355,7 +403,7 @@ if ! pgrep -f "zenpool.py.*node" >/dev/null 2>&1; then
   $cmd
 fi
 EORC
-        success "Added to $rc_file (background on shell start)"
+        info "Added auto-start hook to $rc_file"
     fi
 }
 
