@@ -502,14 +502,24 @@ main() {
         local health
         health="$(curl -sf http://localhost:5052/health 2>/dev/null || true)"
         if [[ -n "$health" ]]; then
-            local nid; nid="$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('node','?'))" 2>/dev/null || echo "?")"
-            success "Node running (ID: $nid)"
-            sleep 2
-            local nodes; nodes="$(curl -sf "$HUB/nodes" 2>/dev/null || true)"
-            if [[ -n "$nodes" ]] && echo "$nodes" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('nodes') else 1)" 2>/dev/null; then
-                success "Hub sees this node (check: curl -s $HUB/nodes)"
+            local nid registered hub_ok
+            nid="$(echo "$health" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('node') or '?')" 2>/dev/null || echo "?")"
+            hub_ok="$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('registered', False))" 2>/dev/null || echo "False")"
+            if [[ "$hub_ok" == "True" ]]; then
+                success "Node running (ID: $nid, hub connected)"
             else
-                warn "Hub /nodes empty — enable linger: sudo loginctl enable-linger $USER"
+                warn "Node process up but hub not connected (cached ID: $nid)"
+            fi
+            sleep 3
+            local nodes; nodes="$(curl -sf "$HUB/nodes" 2>/dev/null || true)"
+            if [[ -n "$nodes" ]] && [[ -n "$nid" ]] && echo "$nodes" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if sys.argv[1] in d.get('nodes',{}) else 1)" "$nid" 2>/dev/null; then
+                success "Hub sees this node ($nid)"
+            elif [[ -n "$nodes" ]] && echo "$nodes" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('nodes') else 1)" 2>/dev/null; then
+                warn "Hub has nodes but not this ID — check: curl -s $HUB/nodes"
+            else
+                warn "Hub /nodes empty — run: curl -sf $HUB/health"
+                warn "Then: sudo loginctl enable-linger $USER && systemctl --user restart zenpool-node"
+                warn "Test hub reachability: curl -sf $HUB/health"
             fi
         else
             warn "Node not responding yet — check service status"

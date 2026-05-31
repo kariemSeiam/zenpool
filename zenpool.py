@@ -171,6 +171,15 @@ class KeyPool:
                           "proxy_url": proxy_url or n.get("proxy_url") or f"http://{ip}:{NODE_PORT}"})
                 if key:
                     n["key"] = key
+            elif node_id:
+                # Re-adopt a pruned node id (same device reconnecting)
+                nid = node_id
+                self.nodes[nid] = {
+                    "name": name, "ip": ip, "device": device, "seen": time.time(),
+                    "proxy_url": proxy_url or f"http://{ip}:{NODE_PORT}",
+                }
+                if key:
+                    self.nodes[nid]["key"] = key
             else:
                 nid = str(uuid.uuid4())[:8]
                 self.nodes[nid] = {
@@ -531,6 +540,7 @@ class NodeClient:
             "ZENPOOL_STATE", os.path.join(os.path.expanduser("~"), ".local", "share", "zenpool"))
         self.state_file = os.path.join(self.state_dir, "node-state.json")
         self.nid = self._load_nid()
+        self.hub_ok = False
         self.name = platform.node() or "unknown"
         self.device = f"{platform.system()}/{platform.machine()}"
 
@@ -572,12 +582,15 @@ class NodeClient:
         r = self._call("/register", payload)
         if r.get("node_id"):
             self.nid = r["node_id"]
+            self.hub_ok = True
             self._save_nid()
             return True
+        self.hub_ok = False
         return False
 
     def heartbeat(self):
-        self._call("/heartbeat", {"node_id": self.nid})
+        r = self._call("/heartbeat", {"node_id": self.nid})
+        self.hub_ok = bool(r.get("ok")) and not r.get("error")
 
     def poll_work(self):
         return self._call("/poll-work", {"node_id": self.nid})
@@ -659,7 +672,8 @@ def run_node(hub_url, local_key=None, proxy_url=None):
         def do_GET(self):
             p = self.path.split("?")[0]
             if p == "/health":
-                self._s({"ok": True, "node": client.nid, "hub": client.hub})
+                self._s({"ok": True, "node": client.nid, "hub": client.hub,
+                         "registered": client.hub_ok})
             elif p == "/models":
                 self._s({"object": "list", "data": [
                     {"id": "deepseek-v4-flash-free"}, {"id": "nemotron-3-super-free"},
@@ -718,9 +732,11 @@ def run_node(hub_url, local_key=None, proxy_url=None):
     # Register + heartbeat + poll hub for work (NAT-safe)
     def _loop():
         while True:
-            if not client.nid:
+            if not client.nid or not client.hub_ok:
                 if client.register():
                     print(f"  ✅ Connected to hub: {client.nid}")
+                elif client.nid:
+                    print(f"  ⚠️  Hub unreachable — retrying (cached id: {client.nid})")
             else:
                 client.heartbeat()
             time.sleep(HEARTBEAT_INTERVAL)
