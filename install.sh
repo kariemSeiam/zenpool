@@ -3,9 +3,8 @@
 #  🐍 ZenPool Installer v2 — Cross-platform, zero-dependency, premium
 #  Usage:
 #    curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.sh | bash
-#    curl -fsSL ... | bash -s -- --key sk-xxx     # node with key donation
 #    curl -fsSL ... | bash -s -- --hub            # install as hub server
-#    curl -fsSL ... | bash -s -- --hub --key sk-xxx
+#    curl -fsSL ... | bash -s -- --key sk-xxx     # optional: local key override on node
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -24,9 +23,10 @@ MUTED='\033[38;2;90;100;128m'
 # ─── Config ──────────────────────────────────────────────────────────
 REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
 DEFAULT_HUB="http://srv880434.hstgr.cloud:5051"
-VERSION="2.0.0"
+VERSION="2.1.0"
 MODE="node"
 KEY=""
+PUBLIC_URL=""
 HUB="$DEFAULT_HUB"
 DRY_RUN=0
 VERBOSE=0
@@ -186,6 +186,7 @@ install_systemd_node() {
     mkdir -p "$svc_dir"
     local exec_start="python3 $INSTALL_DIR/zenpool.py node --hub $HUB"
     [[ -n "$KEY" ]] && exec_start+=" --key $KEY"
+    [[ -n "$PUBLIC_URL" ]] && exec_start+=" --public-url $PUBLIC_URL"
 
     cat > "$svc_dir/zenpool-node.service" << EOSERVICE
 [Unit]
@@ -411,10 +412,11 @@ show_output() {
     else
         echo -e "  ${BOLD}Main endpoint:${NC}  $HUB/v1/chat/completions"
         echo -e "  ${BOLD}Node ID:${NC}       see \`curl -s http://localhost:5052/health\`"
-        [[ -n "$KEY" ]] && echo -e "  ${BOLD}Key donated:${NC}   ✓ (hub will use as fallback)"
         echo ""
-        echo "  This node auto-registered with the hub and heartbeats every 30s."
-        echo "  If the hub's local keys are exhausted, it will route through yours."
+        echo "  Auto-registers with the hub (no key needed on the device)."
+        echo "  Add keys on the hub only — nodes pull keys when running requests."
+        echo "  When the hub hits a rate limit, work runs on this device (your IP)."
+        echo "  Keep the hub alive at $HUB."
     fi
     echo ""
     echo -e "  ${BOLD}Logs:${NC}"
@@ -502,6 +504,13 @@ main() {
         if [[ -n "$health" ]]; then
             local nid; nid="$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('node','?'))" 2>/dev/null || echo "?")"
             success "Node running (ID: $nid)"
+            sleep 2
+            local nodes; nodes="$(curl -sf "$HUB/nodes" 2>/dev/null || true)"
+            if [[ -n "$nodes" ]] && echo "$nodes" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('nodes') else 1)" 2>/dev/null; then
+                success "Hub sees this node (check: curl -s $HUB/nodes)"
+            else
+                warn "Hub /nodes empty — enable linger: sudo loginctl enable-linger $USER"
+            fi
         else
             warn "Node not responding yet — check service status"
         fi
@@ -519,6 +528,8 @@ parse_args() {
             --hub) MODE="hub" ;;
             --key) shift; KEY="$1" ;;
             --key=*) KEY="${1#*=}" ;;
+            --public-url) shift; PUBLIC_URL="$1" ;;
+            --public-url=*) PUBLIC_URL="${1#*=}" ;;
             --hub=*) HUB="${1#*=}" ;;
             --dry-run) DRY_RUN=1 ;;
             --verbose|--debug) VERBOSE=1; set -x ;;
@@ -531,8 +542,9 @@ parse_args() {
                 echo ""
                 echo "Options:"
                 echo "  --hub              Install as hub server (default: node)"
-                echo "  --key <sk-xxx>     API key to donate to hub pool"
                 echo "  --hub=<url>        Custom hub URL (default: $DEFAULT_HUB)"
+                echo "  --public-url <url> Reachable node URL if hub cannot reach you (optional)"
+                echo "  --key <sk-xxx>     Optional local key override (default: keys from hub)"
                 echo "  --verify           Run connectivity check after install"
                 echo "  --dry-run          Print plan, no changes"
                 echo "  --verbose          Debug output"
