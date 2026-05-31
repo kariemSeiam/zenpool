@@ -23,7 +23,7 @@ MUTED='\033[38;2;90;100;128m'
 # ─── Config ──────────────────────────────────────────────────────────
 REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
 DEFAULT_HUB="https://srv880434.hstgr.cloud"
-VERSION="2.1.8"
+VERSION="2.1.9"
 MODE="node"
 KEY=""
 PUBLIC_URL=""
@@ -223,23 +223,34 @@ check_pa_hub_access() {
         return 0
     fi
 
+    # Free PA routes HTTP through Squid — often returns HTML 403 even when HTTPS times out.
     blocked="$(curl -s --max-time 15 "$HUB/health" 2>&1 || true)"
+    if [[ -z "$blocked" ]] && [[ -n "${http_proxy:-${HTTP_PROXY:-}}" ]]; then
+        blocked="$(curl -s --max-time 15 "http://srv880434.hstgr.cloud:5051/health" 2>&1 || true)"
+    fi
     if echo "$blocked" | grep -qiE 'access denied|ERR_ACCESS_DENIED|whitelist|not available from free'; then
-        echo ""
-        error "PythonAnywhere FREE cannot reach ZenPool hub."
-        echo ""
-        echo -e "  ${BOLD}Why:${NC} Free accounts use a Squid proxy that blocks external sites"
-        echo "  except PythonAnywhere's allowlist. srv880434.hstgr.cloud is not allowed."
-        echo ""
-        echo -e "  ${BOLD}Fix:${NC} Upgrade to a paid PythonAnywhere account, then run:"
-        echo "    python3 ~/.local/share/zenpool/zenpool.py node --hub $HUB"
-        echo "  (Web → Tasks → Always-on tasks)"
-        echo ""
-        echo -e "  ${BOLD}Or:${NC} Use your home PC node (pigo/shell) — already online on the hub."
+        pa_hub_blocked_message
         exit 1
     fi
 
-    warn "Hub not reachable yet at $HUB (paid PA: add Always-on task after install)"
+    # On PA, an unreachable hub means the node cannot work — do not pretend install succeeded.
+    pa_hub_blocked_message
+    exit 1
+}
+
+pa_hub_blocked_message() {
+    echo ""
+    error "PythonAnywhere cannot reach ZenPool hub from this account."
+    echo ""
+    echo -e "  ${BOLD}Why:${NC} Free accounts use a Squid proxy that blocks external sites"
+    echo "  except PythonAnywhere's allowlist. srv880434.hstgr.cloud is not allowed."
+    echo ""
+    echo -e "  ${BOLD}Fix:${NC} Upgrade to a paid PythonAnywhere account, then run:"
+    echo "    curl -fsSL \"$REPO/install.sh?v=$VERSION\" | bash"
+    echo "  Then Web → Tasks → Always-on task:"
+    echo "    python3 ~/.local/share/zenpool/zenpool.py node --hub $HUB"
+    echo ""
+    echo -e "  ${BOLD}Or:${NC} Use your home PC node (pigo/shell) — already online on the hub."
 }
 
 # ─── Service installers ──────────────────────────────────────────────
