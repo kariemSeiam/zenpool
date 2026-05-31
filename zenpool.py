@@ -814,7 +814,15 @@ def run_node(hub_url, local_key=None, proxy_url=None):
     print(f"  🔄 Auto-registers; pulls keys from hub when running requests")
     print(f"  📡 Local proxy: http://localhost:{NODE_PORT}/v1/chat/completions")
     print()
-    ThreadingHTTPServer(("0.0.0.0", NODE_PORT), NodeHandler).serve_forever()
+    try:
+        ThreadingHTTPServer(("0.0.0.0", NODE_PORT), NodeHandler).serve_forever()
+    except OSError as e:
+        if e.errno == 98 or "Address already in use" in str(e):
+            print(f"  ❌ Port {NODE_PORT} already in use — another zenpool node is running.")
+            print(f"     Stop it:  pkill -u \"$(id -u)\" -f 'zenpool.py.*node'")
+            print(f"     Or check: curl -s http://localhost:{NODE_PORT}/health")
+            raise SystemExit(1) from e
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════════════
