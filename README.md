@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.
 
 ```
                          ┌──────────────────────────────┐
-                         │   http://srv880434.hstgr.cloud:5051  │
+                         │   https://srv880434.hstgr.cloud  │
                          │       /v1/chat/completions    │
                          └──────────────┬───────────────┘
                                         │
@@ -90,7 +90,7 @@ python3 zenpool.py node --key sk-your-key-here
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://srv880434.hstgr.cloud:5051/v1",
+    base_url="https://srv880434.hstgr.cloud/v1",
     api_key="ignored"
 )
 ```
