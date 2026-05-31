@@ -1,135 +1,132 @@
 # 🐍 ZenPool
 
-**Distributed API key pool for OpenCode Zen.**  
-Pool multiple keys, round-robin across them, auto-cooldown on rate limits. Zero dependencies.
-
-## Architecture
-
-```
-                   ┌──────────────┐
-                   │   ZenPool    │
-                   │    Hub       │
-                   │  (key pool)  │
-                   │  5+ keys     │
-                   └──────┬───────┘
-                          │
-            ┌─────────────┼──────────────┐
-            ▼             ▼              ▼
-     ┌──────────┐  ┌──────────┐  ┌──────────────┐
-     │  Node A  │  │  Node B  │  │  Production  │
-     │ (device) │  │ (device) │  │  App (mcrm)  │
-     │ └─asks   │  │ └─has    │  │ └─uses hub's │
-     │   hub    │  │   own    │  │   API for    │
-     │   for key│  │   --key  │  │   key mgmt   │
-     └────┬─────┘  └────┬─────┘  └──────┬───────┘
-          │             │               │
-          └─────────────┼───────────────┘
-                        ▼
-               ┌──────────────────┐
-               │   OpenCode API   │
-               │ opencode.ai/zen  │
-               └──────────────────┘
-```
-
-**Each request cycle:**
-
-```
-1. App/Node → Hub:     "give me a key"     POST /next-key
-2. Hub      → App:      "use acc-3"
-3. App      → OpenCode:  POST /v1/chat/completions  (with key)
-4. App      → Hub:      "success/fail"     POST /report
-```
-
-Hub is **not in the request path** — it only manages the key pool.  
-If hub dies, nodes with `--key` keep working independently.
-
-## Quick Start
-
-### 🚀 One-command install (systemd)
+**Distributed API key pool for OpenCode Zen — never stop.**  
+One endpoint. Any number of keys. Zero-config nodes that auto-donate.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.sh | bash
 ```
 
-This installs the hub at `/opt/zenpool/` as a systemd service (`zenpool-hub`), auto-starts on boot.
+---
 
-```bash
-# Check status
-systemctl status zenpool-hub
+## The Main Thing
 
-# Add keys
-curl -X POST http://localhost:5051/keys \
-  -H "Content-Type: application/json" \
-  -d '{"key": "sk-...", "label": "acc-1"}'
-
-# View logs
-journalctl -u zenpool-hub -f
+```
+                         ┌──────────────────────────────┐
+                         │   http://srv880434.hstgr.cloud:5051  │
+                         │       /v1/chat/completions    │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │            HUB               │
+                         │  ┌────────────────────────┐  │
+                         │  │   Local keys (primary)  │  │
+                         │  │   Node keys (fallback)  │  │
+                         │  └────────────────────────┘  │
+                         └──────────────┬───────────────┘
+                                        │
+          ┌─────────────────────────────┼─────────────────────────────┐
+          ▼                             ▼                             ▼
+   ┌──────────────┐            ┌──────────────┐            ┌──────────────┐
+   │   Node A     │            │   Node B     │            │   Node C     │
+   │  --key sk-1  │            │  --key sk-2  │            │  no key      │
+   │   ↓          │            │   ↓          │            │   (borrows)  │
+   │ auto-donates │            │ auto-donates │            └──────────────┘
+   │ to hub pool  │            │ to hub pool  │
+   └──────────────┘            └──────────────┘
 ```
 
-### Manual run (hub)
+**You hit the hub → hub grabs the next fresh key from the pool → calls OpenCode → returns.**
+
+- Hub checks **local keys first** (round-robin)
+- If all local keys are in cooldown → falls through to **node-contributed keys**
+- When a key hits 429 → hub cools it (5m → 10m → 20m → ... → 1h)
+- When a node dies → hub removes its key from the pool
+
+---
+
+## Quick Start
+
+### 🚀 One-command (any OS)
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.sh | bash
+```
+
+Auto-detects OS, downloads `zenpool.py`, sets up background service:
+
+| OS | Service | Survives reboot |
+|----|---------|-----------------|
+| Linux (root) | Systemd system service | ✅ |
+| Linux (user) | Systemd user service + linger | ✅ |
+| macOS | LaunchAgent | ✅ |
+| Windows | Scheduled Task | ✅ |
+| Termux | `.bashrc` auto-start | ✅ |
+
+```bash
+# Node with key donation (contributes to hub fallback pool)
+curl -fsSL ... | bash -s -- --key sk-xxxxx
+
+# Hub server (manages the key pool)
+curl -fsSL ... | sudo bash -s -- --hub
+```
+
+### Manual
+
+```bash
+# Hub
 python3 zenpool.py hub
-curl -X POST http://localhost:5051/keys \
-  -H "Content-Type: application/json" \
-  -d '{"key": "sk-...", "label": "acc-1"}'
-```
 
-### Node (with hub)
+# Node (auto-connects to default hub)
+python3 zenpool.py node
 
-```bash
-python3 zenpool.py node --hub http://your-server:5051
-```
-
-### Node (standalone, no hub needed)
-
-```bash
+# Node with key donation
 python3 zenpool.py node --key sk-your-key-here
 ```
 
-Then use `http://localhost:5052/v1/chat/completions` in any OpenAI-compatible client.
-
-### Production app (direct API)
+### API usage
 
 ```python
-import urllib.request, json
+from openai import OpenAI
 
-# 1. Get a key from hub
-r = urllib.request.urlopen("http://localhost:5051/next-key")
-key = json.loads(r.read())["key"]
-
-# 2. Call OpenCode directly
-req = urllib.request.Request(
-    "https://opencode.ai/zen/v1/chat/completions",
-    data=json.dumps({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}]}).encode(),
-    headers={"Content-Type":"application/json","Authorization":f"Bearer {key}","User-Agent":"curl/7.76.1"}
+client = OpenAI(
+    base_url="http://srv880434.hstgr.cloud:5051/v1",
+    api_key="ignored"
 )
-r = urllib.request.urlopen(req)
-
-# 3. Report back
-urllib.request.urlopen("http://localhost:5051/report",
-    data=json.dumps({"key_id": key_id, "ok": True}).encode(),
-    headers={"Content-Type":"application/json"})
 ```
+
+---
 
 ## Key Features
 
-- **Round-robin** across all non-rate-limited keys
-- **Exponential backoff** on 429: 5m → 10m → 20m → 40m → 1h max
-- **ThreadingHTTPServer** — handles concurrent requests
-- **`--key` flag** — run node standalone, no hub dependency
-- **Zero dependencies** — stdlib only, Python 3.8+
+| Feature | What it does |
+|---------|-------------|
+| **Round-robin** | Distributes across all non-cooled keys |
+| **Exponential backoff** | 5m → 10m → 20m → 40m → 1h on 429 |
+| **Node key donation** | Every `--key` on any device auto-feeds the hub fallback pool |
+| **Fallback pool** | When local keys are dry, hub uses node-contributed keys |
+| **Auto-pruning** | Dead nodes → their keys leave the pool (90s timeout) |
+| **Cross-platform install** | Linux, macOS, Windows, Termux — one command |
+| **Background service** | systemd / launchd / scheduled task |
+| **Zero dependencies** | Python stdlib only (3.8+) |
+| **Concurrent** | ThreadingHTTPServer handles parallel requests |
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Hub status |
-| GET | `/keys` | All keys |
-| POST | `/keys` | Add key |
-| DELETE | `/keys/<id>` | Remove key |
-| POST | `/next-key` | Get next available key (RR) |
-| POST | `/report` | Report success/error |
-| POST | `/register` | Node registration |
-| POST | `/heartbeat` | Node heartbeat |
-| POST | `/v1/chat/completions` | Direct proxy through hub |
+| GET | `/health` | Hub status + key/node counts |
+| GET | `/keys` | All local keys + cooldown status |
+| POST | `/keys` | Add a key to the pool |
+| DELETE | `/keys/<id>` | Remove a key |
+| POST | `/next-key` | Get next available key (round-robin) |
+| POST | `/report` | Report success/failure for a key |
+| POST | `/register` | Node registration (auto-sends `--key`) |
+| POST | `/heartbeat` | Node heartbeat (30s interval) |
+| POST | `/v1/chat/completions` | **Direct proxy — main endpoint** |
+| GET | `/v1/models` | Available models |
+| GET | `/nodes` | List registered nodes |
+
+---
+
+🐍🐙∞
