@@ -22,7 +22,7 @@ from hashlib import sha256
 # ─── Config ──────────────────────────────────────────────────────────
 
 VERSION = "2.1.7"
-DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "http://srv880434.hstgr.cloud:5051")
+DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "https://srv880434.hstgr.cloud")
 HUB_PORT = int(os.environ.get("ZENPOOL_PORT", 5051))
 NODE_PORT = int(os.environ.get("ZENPOOL_NODE_PORT", 5052))
 DATA_FILE = os.environ.get("ZENPOOL_DATA", "zenpool-data.json")
