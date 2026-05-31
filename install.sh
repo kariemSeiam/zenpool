@@ -23,7 +23,7 @@ MUTED='\033[38;2;90;100;128m'
 # ─── Config ──────────────────────────────────────────────────────────
 REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
 DEFAULT_HUB="http://srv880434.hstgr.cloud:5051"
-VERSION="2.1.5"
+VERSION="2.1.6"
 MODE="node"
 KEY=""
 PUBLIC_URL=""
@@ -137,7 +137,18 @@ ui_plan() {
     fi
 }
 
+PA=0
+
 # ─── OS detection ────────────────────────────────────────────────────
+detect_pythonanywhere() {
+    [[ -n "${PYTHONANYWHERE_DOMAIN:-}" ]] && return 0
+    [[ -n "${PYTHONANYWHERE_SITE:-}" ]] && return 0
+    [[ "${HOSTNAME:-}" == *pythonanywhere* ]] && return 0
+    hostname 2>/dev/null | grep -qi pythonanywhere && return 0
+    [[ -f /usr/local/bin/pa-website-check ]] && return 0
+    return 1
+}
+
 detect_os() {
     case "$(uname -s)" in
         Linux*)  OS="linux" ;;
@@ -145,6 +156,12 @@ detect_os() {
         CYGWIN*|MINGW*|MSYS*) OS="windows" ;;
         *)       OS="linux" ;;
     esac
+    if detect_pythonanywhere; then
+        PA=1
+        INIT="generic"
+        SERVICE_TYPE="user"
+        return
+    fi
     [[ "$(id -u)" == "0" ]] && SERVICE_TYPE="system" || SERVICE_TYPE="user"
     command -v systemctl &>/dev/null && INIT="systemd" && return
     command -v launchctl &>/dev/null && INIT="launchd" && return
@@ -216,10 +233,40 @@ setup_user_systemd_env() {
 
 user_systemctl() {
     setup_user_systemd_env || return 1
-    systemctl --user "$@"
+    systemctl --user "$@" 2>/dev/null
+}
+
+install_pythonanywhere_node() {
+    local run_cmd="python3 $INSTALL_DIR/zenpool.py node --hub $HUB"
+    [[ -n "$KEY" ]] && run_cmd+=" --key $KEY"
+    [[ -n "$PUBLIC_URL" ]] && run_cmd+=" --public-url $PUBLIC_URL"
+
+    if ! pgrep -u "$(id -u)" -f "zenpool.py.*node" >/dev/null 2>&1; then
+        nohup bash -c "$run_cmd >> '$INSTALL_DIR/zenpool.log' 2>&1" &
+        sleep 2
+    fi
+    success "ZenPool node installed (PythonAnywhere mode)"
+    echo ""
+    echo -e "  ${WARN}PythonAnywhere: no systemd, sudo, or su.${NC}"
+    echo ""
+    echo -e "  ${BOLD}Paid account — Always-on task:${NC}"
+    echo "    $run_cmd"
+    echo "    Web UI → Tasks → Always-on tasks → paste command above"
+    echo ""
+    echo -e "  ${BOLD}Any account — run in a console (stays up while open):${NC}"
+    echo "    $run_cmd"
+    echo ""
+    echo -e "  ${BOLD}If hub unreachable, whitelist:${NC} srv880434.hstgr.cloud"
+    echo -e "  ${BOLD}Logs:${NC} tail -f $INSTALL_DIR/zenpool.log"
 }
 
 install_systemd_node() {
+    if ! setup_user_systemd_env; then
+        warn "No user D-Bus session — using background runner"
+        install_generic_bg
+        return 0
+    fi
+
     local svc_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$svc_dir"
     local exec_start="python3 $INSTALL_DIR/zenpool.py node --hub $HUB"
@@ -469,7 +516,13 @@ show_output() {
     echo ""
     echo -e "  ${BOLD}Logs:${NC}"
     case "$OS" in
-        linux)  echo "    journalctl --user -u zenpool-node -f" ;;
+        linux)
+            if [[ "$PA" == "1" ]]; then
+                echo "    tail -f '$INSTALL_DIR/zenpool.log'"
+            else
+                echo "    journalctl --user -u zenpool-node -f"
+            fi
+            ;;
         macos)  echo "    tail -f '$INSTALL_DIR/zenpool.log'" ;;
         windows) echo "    type '$INSTALL_DIR/zenpool.log'" ;;
     esac
@@ -520,6 +573,8 @@ main() {
             if [[ "$MODE" == "hub" ]]; then
                 [[ "$SERVICE_TYPE" != "system" ]] && { error "Hub needs root: sudo bash ... -- --hub"; exit 1; }
                 gum_spin "Installing hub service" install_systemd_hub
+            elif [[ "$PA" == "1" ]]; then
+                gum_spin "Installing node (PythonAnywhere)" install_pythonanywhere_node
             else
                 gum_spin "Installing node service" install_systemd_node
             fi
@@ -565,9 +620,14 @@ main() {
             elif [[ -n "$nodes" ]] && echo "$nodes" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('nodes') else 1)" 2>/dev/null; then
                 warn "Hub has nodes but not this ID — check: curl -s $HUB/nodes"
             else
-                warn "Hub /nodes empty — run: curl -sf $HUB/health"
-                warn "Then: sudo loginctl enable-linger $USER && systemctl --user restart zenpool-node"
-                warn "Test hub reachability: curl -sf $HUB/health"
+                warn "Hub /nodes empty — is the node process running?"
+                if [[ "$PA" == "1" ]]; then
+                    warn "PythonAnywhere: use an Always-on task or keep a console open"
+                    warn "  python3 $INSTALL_DIR/zenpool.py node --hub $HUB"
+                else
+                    warn "Try: systemctl --user restart zenpool-node"
+                    warn "Or: curl -sf $HUB/health"
+                fi
             fi
         else
             warn "Node not responding yet — check service status"
