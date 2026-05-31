@@ -23,7 +23,7 @@ MUTED='\033[38;2;90;100;128m'
 # ─── Config ──────────────────────────────────────────────────────────
 REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
 CDN="https://cdn.jsdelivr.net/gh/kariemSeiam/zenpool"
-COMMIT="6905e07"
+COMMIT="8344c81"
 DEFAULT_HUB="https://srv880434.hstgr.cloud"
 VERSION="2.1.10"
 MODE="node"
