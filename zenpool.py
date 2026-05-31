@@ -258,12 +258,12 @@ def run_hub():
                         self.wfile.write(r.read())
             except urllib.error.HTTPError as e:
                 pool.report_error(k["id"])
+                raw = b""
                 try:
-                    data = e.read()
-                    # OpenCode sometimes returns non-JSON errors
-                    body = json.loads(data) if data else {"error": f"HTTP {e.code}"}
+                    raw = e.read()
+                    body = json.loads(raw) if raw else {"error": f"HTTP {e.code}"}
                 except (json.JSONDecodeError, TypeError):
-                    body = {"error": f"upstream HTTP {e.code}", "detail": data.decode(errors='replace')[:200]}
+                    body = {"error": f"upstream HTTP {e.code}", "detail": raw.decode(errors='replace')[:200]}
                 self._s(body, e.code)
             except urllib.error.URLError as e:
                 self._e(f"upstream unreachable: {e.reason}", 502)
@@ -409,12 +409,12 @@ def run_node(hub_url, local_key=None):
             except urllib.error.HTTPError as e:
                 if key and key["id"]:
                     client.report(key["id"], ok=False)
-                data = e.read()
+                raw = e.read()
                 self.send_response(e.code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(data)
+                self.wfile.write(raw)
             except Exception as e:
                 self._e(str(e), 502)
 
