@@ -11,7 +11,6 @@ Install: curl -fsSL https://<your-host>/zenpool.py | python3 - node
 import json
 import os
 import platform
-import subprocess
 import threading
 import time
 import uuid
@@ -22,7 +21,8 @@ from hashlib import sha256
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
+DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "http://srv880434.hstgr.cloud:5051")
 HUB_PORT = int(os.environ.get("ZENPOOL_PORT", 5051))
 NODE_PORT = int(os.environ.get("ZENPOOL_NODE_PORT", 5052))
 DATA_FILE = os.environ.get("ZENPOOL_DATA", "zenpool-data.json")
@@ -35,12 +35,15 @@ ZEN_API = "https://opencode.ai/zen/v1/chat/completions"
 # ═══════════════════════════════════════════════════════════════════════
 
 class KeyPool:
-    """Central key pool with round-robin + rate-limit backoff."""
+    """Central key pool with round-robin + rate-limit backoff.
+    Falls through to node-contributed keys when local pool is dry.
+    """
 
     def __init__(self):
         self.keys = {}
-        self.nodes = {}
+        self.nodes = {}  # nid -> {name, ip, device, seen, key?}
         self._rr = 0
+        self._rr_node = 0
         self._lock = threading.Lock()
         self._load()
 
@@ -72,7 +75,7 @@ class KeyPool:
             self._save()
 
     def get_key(self):
-        """Round-robin across non-cooled keys."""
+        """Round-robin across non-cooled keys (local pool only)."""
         with self._lock:
             now = time.time()
             active = [k for k, v in self.keys.items() if v["active"] and v["cool_until"] < now]
@@ -83,7 +86,25 @@ class KeyPool:
             k = self.keys[kid]
             k["total"] += 1
             k["last_used"] = now
-            return {"id": kid, "key": k["key"], "label": k["label"]}
+            return {"id": kid, "key": k["key"], "label": k["label"], "source": "local"}
+
+    def get_any_key(self):
+        """Try local pool first, fall back to node-contributed keys."""
+        with self._lock:
+            now = time.time()
+            k = self.get_key()
+            if k:
+                return k
+            # Fall through to node keys
+            active_nodes = [(nid, n) for nid, n in self.nodes.items()
+                           if n.get("key") and now - n.get("seen", 0) < 120]
+            if not active_nodes:
+                return None
+            self._rr_node = (self._rr_node + 1) % len(active_nodes)
+            nid, n = active_nodes[self._rr_node]
+            n["total"] = n.get("total", 0) + 1
+            n["last_used"] = now
+            return {"id": f"node:{nid}", "key": n["key"], "label": f"node-{nid}", "source": "node"}
 
     def report_error(self, kid):
         with self._lock:
@@ -110,10 +131,12 @@ class KeyPool:
                 "cool_remaining": max(0, int(kv["cool_until"] - now))
             } for kid, kv in self.keys.items()}
 
-    def register_node(self, name, ip, device="unknown"):
+    def register_node(self, name, ip, device="unknown", key=None):
         nid = str(uuid.uuid4())[:8]
         with self._lock:
             self.nodes[nid] = {"name": name, "ip": ip, "device": device, "seen": time.time()}
+            if key:
+                self.nodes[nid]["key"] = key
             self._save()
         return nid
 
@@ -121,19 +144,25 @@ class KeyPool:
         with self._lock:
             if nid in self.nodes:
                 self.nodes[nid]["seen"] = time.time()
+                self._save()
 
     def list_nodes(self):
         with self._lock:
             now = time.time()
-            return {nid: n | {"online": now - n["seen"] < 60}
+            return {nid: {"name": n.get("name", "?"), "ip": n.get("ip", "?"),
+                          "device": n.get("device", "?"),
+                          "online": now - n.get("seen", 0) < 60,
+                          "has_key": bool(n.get("key"))}
                     for nid, n in self.nodes.items()}
 
     def prune(self, timeout=90):
         with self._lock:
             now = time.time()
-            dead = [nid for nid, n in self.nodes.items() if now - n["seen"] > timeout]
+            dead = [nid for nid, n in self.nodes.items() if now - n.get("seen", 0) > timeout]
             for nid in dead:
                 del self.nodes[nid]
+            if dead:
+                self._save()
 
 
 # ─── Hub HTTP Server ─────────────────────────────────────────────────
@@ -169,7 +198,10 @@ def run_hub():
         def do_GET(self):
             p = self.path.split("?")[0]
             if p == "/health":
-                self._s({"ok": True, "host": platform.node(), "keys": len(pool.keys), "nodes": len(pool.nodes)})
+                node_keys = sum(1 for n in pool.nodes.values() if n.get("key"))
+                self._s({"ok": True, "host": platform.node(),
+                         "keys": len(pool.keys), "node_keys": node_keys,
+                         "nodes": len(pool.nodes)})
             elif p == "/v1/models":
                 self._s({"object": "list", "data": [
                     {"id": "big-pickle", "object": "model", "owned_by": "opencode"},
@@ -182,8 +214,6 @@ def run_hub():
                 self._s({"keys": pool.list_keys()})
             elif p == "/nodes":
                 self._s({"nodes": pool.list_nodes()})
-            elif p == "/version":
-                self._s({"version": VERSION, "source": "github.com/kariemSeiam/zenpool"})
             else:
                 self._e("not found", 404)
 
@@ -199,7 +229,12 @@ def run_hub():
                 kid = pool.add_key(b["key"], b.get("label", ""))
                 self._s({"id": kid})
             elif p == "/register":
-                nid = pool.register_node(b.get("name", f"n-{len(pool.nodes)+1}"), self.client_address[0], b.get("device"))
+                nid = pool.register_node(
+                    b.get("name", f"n-{len(pool.nodes)+1}"),
+                    self.client_address[0],
+                    b.get("device"),
+                    key=b.get("key")
+                )
                 self._s({"node_id": nid, "interval": HEARTBEAT_INTERVAL})
             elif p == "/heartbeat":
                 pool.heartbeat(b.get("node_id"))
@@ -218,20 +253,6 @@ def run_hub():
                 else:
                     pool.report_error(kid)
                 self._s({"ok": True})
-            elif p == "/update":
-                try:
-                    url = "https://raw.githubusercontent.com/kariemSeiam/zenpool/master/zenpool.py"
-                    req = urllib.request.Request(url, headers={"User-Agent": "zenpool/1.0"})
-                    with urllib.request.urlopen(req, timeout=30) as r:
-                        code = r.read()
-                    dest = os.environ.get("ZENPOOL_SELF", "/opt/zenpool/zenpool.py")
-                    with open(dest, "wb") as f:
-                        f.write(code)
-                    self._s({"ok": True, "message": "updated, restarting..."})
-                    pool._save()
-                    threading.Thread(target=lambda: subprocess.run(["systemctl", "restart", "zenpool-hub"]), daemon=True).start()
-                except Exception as e:
-                    self._e(f"update failed: {e}")
             elif p == "/v1/chat/completions":
                 self._proxy(b, pool)
             else:
@@ -246,7 +267,7 @@ def run_hub():
                 self._e("not found", 404)
 
         def _proxy(self, body, pool):
-            k = pool.get_key()
+            k = pool.get_any_key()
             if not k:
                 return self._e("no keys available", 503)
             req = urllib.request.Request(
@@ -331,7 +352,10 @@ class NodeClient:
             return {"error": str(e)}
 
     def register(self):
-        r = self._call("/register", {"name": self.name, "device": self.device})
+        payload = {"name": self.name, "device": self.device}
+        if self.local_key:
+            payload["key"] = self.local_key
+        r = self._call("/register", payload)
         if r.get("node_id"):
             self.nid = r["node_id"]
             return True
@@ -468,8 +492,8 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(prog="zenpool", description="ZenPool — distributed key proxy for OpenCode")
     p.add_argument("mode", choices=["hub", "node"], help="run as hub (server) or node (agent)")
-    p.add_argument("--hub", default="http://localhost:5051", help="hub URL (for node mode)")
-    p.add_argument("--key", default=None, help="local API key (node runs standalone, no hub needed)")
+    p.add_argument("--hub", default=DEFAULT_HUB, help="hub URL (for node mode, default: " + DEFAULT_HUB + ")")
+    p.add_argument("--key", default=None, help="local API key (auto-donates to hub for fallback pool)")
 
     args = p.parse_args()
 
