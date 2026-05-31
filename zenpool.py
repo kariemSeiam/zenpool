@@ -74,28 +74,30 @@ class KeyPool:
             self.keys.pop(kid, None)
             self._save()
 
+    def _pick_local_key(self, now):
+        """Round-robin across non-cooled local keys. Caller must hold self._lock."""
+        active = [k for k, v in self.keys.items() if v["active"] and v["cool_until"] < now]
+        if not active:
+            return None
+        self._rr = (self._rr + 1) % len(active)
+        kid = active[self._rr]
+        k = self.keys[kid]
+        k["total"] += 1
+        k["last_used"] = now
+        return {"id": kid, "key": k["key"], "label": k["label"], "source": "local"}
+
     def get_key(self):
         """Round-robin across non-cooled keys (local pool only)."""
         with self._lock:
-            now = time.time()
-            active = [k for k, v in self.keys.items() if v["active"] and v["cool_until"] < now]
-            if not active:
-                return None
-            self._rr = (self._rr + 1) % len(active)
-            kid = active[self._rr]
-            k = self.keys[kid]
-            k["total"] += 1
-            k["last_used"] = now
-            return {"id": kid, "key": k["key"], "label": k["label"], "source": "local"}
+            return self._pick_local_key(time.time())
 
     def get_any_key(self):
         """Try local pool first, fall back to node-contributed keys."""
         with self._lock:
             now = time.time()
-            k = self.get_key()
+            k = self._pick_local_key(now)
             if k:
                 return k
-            # Fall through to node keys
             active_nodes = [(nid, n) for nid, n in self.nodes.items()
                            if n.get("key") and now - n.get("seen", 0) < 120]
             if not active_nodes:
@@ -171,7 +173,7 @@ def run_hub():
     pool = KeyPool()
 
     class HubHandler(BaseHTTPRequestHandler):
-        def log_message(self, *a):
+        def log_message(self, format, *args):
             pass
 
         def _s(self, data, code=200):
@@ -278,7 +280,8 @@ def run_hub():
             )
             try:
                 with urllib.request.urlopen(req, timeout=120) as r:
-                    pool.report_ok(k["id"])
+                    if k.get("source") == "local":
+                        pool.report_ok(k["id"])
                     ctype = r.headers.get("Content-Type", "application/json")
                     self.send_response(r.status)
                     self.send_header("Content-Type", ctype)
@@ -295,7 +298,9 @@ def run_hub():
                     else:
                         self.wfile.write(r.read())
             except urllib.error.HTTPError as e:
-                pool.report_error(k["id"])
+                # Only rotate/cooldown keys on rate limits — not client errors (400) or unsupported models (401)
+                if k.get("source") == "local" and e.code in (429, 403, 503):
+                    pool.report_error(k["id"])
                 raw = b""
                 try:
                     raw = e.read()
@@ -376,7 +381,7 @@ def run_node(hub_url, local_key=None):
     client = NodeClient(hub_url, local_key=local_key)
 
     class NodeHandler(BaseHTTPRequestHandler):
-        def log_message(self, *a):
+        def log_message(self, format, *args):
             pass
 
         def _s(self, data, code=200):
