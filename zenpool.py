@@ -11,6 +11,7 @@ Install: curl -fsSL https://<your-host>/zenpool.py | python3 - node
 import json
 import os
 import platform
+import subprocess
 import threading
 import time
 import uuid
@@ -181,6 +182,8 @@ def run_hub():
                 self._s({"keys": pool.list_keys()})
             elif p == "/nodes":
                 self._s({"nodes": pool.list_nodes()})
+            elif p == "/version":
+                self._s({"version": VERSION, "source": "github.com/kariemSeiam/zenpool"})
             else:
                 self._e("not found", 404)
 
@@ -215,6 +218,20 @@ def run_hub():
                 else:
                     pool.report_error(kid)
                 self._s({"ok": True})
+            elif p == "/update":
+                try:
+                    url = "https://raw.githubusercontent.com/kariemSeiam/zenpool/master/zenpool.py"
+                    req = urllib.request.Request(url, headers={"User-Agent": "zenpool/1.0"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        code = r.read()
+                    dest = os.environ.get("ZENPOOL_SELF", "/opt/zenpool/zenpool.py")
+                    with open(dest, "wb") as f:
+                        f.write(code)
+                    self._s({"ok": True, "message": "updated, restarting..."})
+                    pool._save()
+                    threading.Thread(target=lambda: subprocess.run(["systemctl", "restart", "zenpool-hub"]), daemon=True).start()
+                except Exception as e:
+                    self._e(f"update failed: {e}")
             elif p == "/v1/chat/completions":
                 self._proxy(b, pool)
             else:

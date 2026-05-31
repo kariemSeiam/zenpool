@@ -12,6 +12,7 @@ RestartSec=5
 User=root
 Environment=ZENPOOL_PORT=5051
 Environment=ZENPOOL_DATA=/opt/zenpool/zenpool-data.json
+Environment=ZENPOOL_SELF=/opt/zenpool/zenpool.py
 
 [Install]
 WantedBy=multi-user.target
