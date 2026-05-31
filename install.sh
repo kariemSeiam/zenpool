@@ -23,7 +23,7 @@ MUTED='\033[38;2;90;100;128m'
 # ─── Config ──────────────────────────────────────────────────────────
 REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
 DEFAULT_HUB="http://srv880434.hstgr.cloud:5051"
-VERSION="2.1.3"
+VERSION="2.1.4"
 MODE="node"
 KEY=""
 PUBLIC_URL=""

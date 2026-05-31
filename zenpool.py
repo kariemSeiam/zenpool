@@ -21,16 +21,16 @@ from hashlib import sha256
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-VERSION = "2.1.3"
+VERSION = "2.1.4"
 DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "http://srv880434.hstgr.cloud:5051")
 HUB_PORT = int(os.environ.get("ZENPOOL_PORT", 5051))
 NODE_PORT = int(os.environ.get("ZENPOOL_NODE_PORT", 5052))
 DATA_FILE = os.environ.get("ZENPOOL_DATA", "zenpool-data.json")
 HEARTBEAT_INTERVAL = 30
-POLL_INTERVAL = 3
+POLL_INTERVAL = 1
 WORK_TIMEOUT = 120
 PUSH_TIMEOUT = 4
-PULL_TIMEOUT = 45
+PULL_TIMEOUT = 90
 ZEN_API = "https://opencode.ai/zen/v1/chat/completions"
 
 
@@ -159,8 +159,9 @@ class KeyPool:
                 return
             k["errors"] += 1
             if code == 429:
-                # Short cooldown on rate limit — rotate quickly to other keys
-                backoff = min(60 * (2 ** min(k["errors"] - 1, 3)), 600)
+                backoff = min(30 * (2 ** min(k["errors"] - 1, 2)), 120)
+            elif code in (403, 503):
+                backoff = min(30 * k["errors"], 90)
             else:
                 backoff = min(300 * (2 ** min(k["errors"] - 1, 4)), 3600)
             k["cool_until"] = time.time() + backoff
@@ -482,29 +483,37 @@ def run_hub():
         def _proxy(self, body, pool):
             tried_local = set()
             node_attempts = 0
-            max_node_attempts = max(pool.active_node_count() * 3, 3)
-            max_tries = max(len(pool.keys) + pool.active_node_count(), 1) * 2
+            max_node_attempts = max(pool.active_node_count() * 5, 5)
+            max_tries = max(len(pool.keys) + pool.active_node_count(), 1) * 3
             last_resp = None
             last_code = 503
-            prefer_node = False
+            prefer_node = pool.active_node_count() > 0 and not pool.get_key()
 
             for _ in range(max_tries):
                 k = pool.get_any_key(prefer_node=prefer_node)
                 prefer_node = False
+                if not k:
+                    k = pool.get_key_for_node()
+                    if k:
+                        k = {**k, "source": "local-fallback"}
                 if not k:
                     break
 
                 if k.get("source") == "node":
                     node_attempts += 1
                     if node_attempts > max_node_attempts:
-                        break
+                        prefer_node = False
+                        continue
                     if self._dispatch_via_node(body, k):
                         return
+                    prefer_node = True
                     continue
 
-                if k["id"] in tried_local:
-                    break
-                tried_local.add(k["id"])
+                kid = k["id"]
+                if kid in tried_local:
+                    prefer_node = pool.active_node_count() > 0
+                    continue
+                tried_local.add(kid)
 
                 req = urllib.request.Request(
                     ZEN_API,
@@ -514,7 +523,7 @@ def run_hub():
                 )
                 try:
                     with urllib.request.urlopen(req, timeout=120) as r:
-                        pool.report_ok(k["id"])
+                        pool.report_ok(kid)
                         self._relay_response(r)
                         return
                 except urllib.error.HTTPError as e:
@@ -527,11 +536,19 @@ def run_hub():
                     last_resp = resp_body
                     last_code = e.code
                     if e.code == 429:
-                        pool.report_error(k["id"], 429)
-                        prefer_node = True  # hub IP rate-limited — use node IP next
+                        pool.report_error(kid, 429)
+                        prefer_node = pool.active_node_count() > 0
                         continue
-                    if e.code in (403, 503):
-                        pool.report_error(k["id"], e.code)
+                    if e.code == 503:
+                        prefer_node = pool.active_node_count() > 0
+                        continue
+                    if e.code == 403:
+                        pool.report_error(kid, 403)
+                        prefer_node = pool.active_node_count() > 0
+                        continue
+                    if e.code >= 500:
+                        prefer_node = pool.active_node_count() > 0
+                        continue
                     self._s(resp_body, e.code)
                     return
                 except urllib.error.URLError as e:
