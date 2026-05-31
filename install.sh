@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/main"
+REPO="https://raw.githubusercontent.com/kariemSeiam/zenpool/master"
 DEST="/opt/zenpool"
 
 echo "  🐍 Installing ZenPool Hub..."

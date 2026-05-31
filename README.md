@@ -48,7 +48,7 @@ If hub dies, nodes with `--key` keep working independently.
 ### 🚀 One-command install (systemd)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.sh | bash
 ```
 
 This installs the hub at `/opt/zenpool/` as a systemd service (`zenpool-hub`), auto-starts on boot.
