@@ -21,7 +21,7 @@ from hashlib import sha256
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-VERSION = "2.1.0"
+VERSION = "2.1.2"
 DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "http://srv880434.hstgr.cloud:5051")
 HUB_PORT = int(os.environ.get("ZENPOOL_PORT", 5051))
 NODE_PORT = int(os.environ.get("ZENPOOL_NODE_PORT", 5052))
@@ -29,6 +29,8 @@ DATA_FILE = os.environ.get("ZENPOOL_DATA", "zenpool-data.json")
 HEARTBEAT_INTERVAL = 30
 POLL_INTERVAL = 3
 WORK_TIMEOUT = 120
+PUSH_TIMEOUT = 4
+PULL_TIMEOUT = 45
 ZEN_API = "https://opencode.ai/zen/v1/chat/completions"
 
 
@@ -209,6 +211,14 @@ class KeyPool:
                           "online": now - n.get("seen", 0) < 60}
                     for nid, n in self.nodes.items()}
 
+    def remove_node(self, nid):
+        with self._lock:
+            if nid in self.nodes:
+                del self.nodes[nid]
+                self._save()
+                return True
+        return False
+
     def prune(self, timeout=90):
         with self._lock:
             now = time.time()
@@ -386,6 +396,9 @@ def run_hub():
             if p.startswith("/keys/"):
                 pool.remove_key(p.split("/")[-1])
                 self._s({"ok": True})
+            elif p.startswith("/nodes/"):
+                ok = pool.remove_node(p.split("/")[-1])
+                self._s({"ok": ok}, 200 if ok else 404)
             else:
                 self._e("not found", 404)
 
@@ -405,7 +418,7 @@ def run_hub():
             else:
                 self.wfile.write(r.read())
 
-        def _forward_to_node(self, body, k):
+        def _forward_to_node(self, body, k, timeout=PUSH_TIMEOUT):
             """Route request through the node proxy so OpenCode sees the node's IP."""
             url = f"{k['proxy_url'].rstrip('/')}/v1/chat/completions"
             req = urllib.request.Request(
@@ -414,11 +427,23 @@ def run_hub():
                 headers={"Content-Type": "application/json", "X-ZenPool-Hub": "1",
                          "User-Agent": "curl/7.76.1"},
             )
-            with urllib.request.urlopen(req, timeout=WORK_TIMEOUT) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 self._relay_response(r)
 
         def _dispatch_via_node(self, body, k):
-            """Push to node if reachable; otherwise pull via hub queue (NAT-safe)."""
+            """Pull work via hub queue (NAT-safe), then optional quick push."""
+            item = work_queue.dispatch(body, k["nid"], timeout=PULL_TIMEOUT)
+            if item:
+                self.send_response(item["status"])
+                for hk, hv in item.get("headers", {}).items():
+                    if hk.lower() not in ("transfer-encoding", "connection"):
+                        self.send_header(hk, hv)
+                if not item.get("headers"):
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(item["result"])
+                return True
             try:
                 self._forward_to_node(body, k)
                 return True
@@ -431,21 +456,7 @@ def run_hub():
                 self.wfile.write(raw)
                 return True
             except (urllib.error.URLError, OSError, TimeoutError):
-                pass
-
-            item = work_queue.dispatch(body, k["nid"])
-            if not item:
                 return False
-            self.send_response(item["status"])
-            for hk, hv in item.get("headers", {}).items():
-                if hk.lower() not in ("transfer-encoding", "connection"):
-                    self.send_header(hk, hv)
-            if not item.get("headers"):
-                self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(item["result"])
-            return True
 
         def _proxy(self, body, pool):
             tried = set()
