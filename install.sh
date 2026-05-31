@@ -143,10 +143,23 @@ PA=0
 detect_pythonanywhere() {
     [[ -n "${PYTHONANYWHERE_DOMAIN:-}" ]] && return 0
     [[ -n "${PYTHONANYWHERE_SITE:-}" ]] && return 0
+    [[ -n "${PYTHONANYWHERE_USERNAME:-}" ]] && return 0
     [[ "${HOSTNAME:-}" == *pythonanywhere* ]] && return 0
     hostname 2>/dev/null | grep -qi pythonanywhere && return 0
     [[ -f /usr/local/bin/pa-website-check ]] && return 0
+    [[ -d /usr/local/share/pa_pythonanywhere ]] && return 0
     return 1
+}
+
+# Hosts with systemctl but no user session (PythonAnywhere, shared SSH, etc.)
+detect_restricted_host() {
+    detect_pythonanywhere && return 0
+    local uid
+    uid="$(id -u)"
+    [[ -d "/run/user/$uid" ]] && return 1
+    [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]] && return 1
+    command -v systemctl &>/dev/null || return 1
+    return 0
 }
 
 detect_os() {
@@ -156,7 +169,7 @@ detect_os() {
         CYGWIN*|MINGW*|MSYS*) OS="windows" ;;
         *)       OS="linux" ;;
     esac
-    if detect_pythonanywhere; then
+    if detect_pythonanywhere || { [[ "$MODE" == "node" ]] && detect_restricted_host; }; then
         PA=1
         INIT="generic"
         SERVICE_TYPE="user"
@@ -293,7 +306,7 @@ WantedBy=default.target
 EOSERVICE
 
     if user_systemctl daemon-reload && user_systemctl enable --now zenpool-node.service; then
-        if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+        if command -v loginctl &>/dev/null && ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
             loginctl enable-linger "$USER" 2>/dev/null || \
                 sudo loginctl enable-linger "$USER" 2>/dev/null || \
                 warn "Could not enable linger — service runs only while logged in"
@@ -302,11 +315,13 @@ EOSERVICE
         return 0
     fi
 
-    warn "User systemd unavailable (no D-Bus session) — using background runner"
-    install_generic_bg
-    warn "For a proper service, either:"
-    warn "  su - $USER -c 'curl -fsSL $REPO/install.sh | bash'"
-    warn "  or: sudo loginctl enable-linger $USER && systemctl --user enable --now zenpool-node"
+    warn "User systemd unavailable — using background runner"
+    if [[ "$PA" == "1" ]]; then
+        install_pythonanywhere_node
+    else
+        install_generic_bg
+    fi
+    return 0
 }
 
 install_systemd_hub() {
@@ -548,7 +563,7 @@ main() {
     # ── Stage 1: Plan ──
     stage 1 3 "Planning"
 
-    local plan="OS: $OS\nInit: $INIT\nMode: $MODE\nDir: $INSTALL_DIR"
+    local plan="OS: $OS\nInit: $INIT\nMode: $MODE\nDir: $INSTALL_DIR\nInstaller: v$VERSION"
     [[ "$MODE" == "node" ]] && plan+="\nHub: $HUB"
     [[ -n "$KEY" ]] && plan+="\nKey: ✓ will donate to hub"
     ui_plan "$(echo -e "$plan")"
