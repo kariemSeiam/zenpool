@@ -21,7 +21,7 @@ from hashlib import sha256
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-VERSION = "2.1.2"
+VERSION = "2.1.3"
 DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "http://srv880434.hstgr.cloud:5051")
 HUB_PORT = int(os.environ.get("ZENPOOL_PORT", 5051))
 NODE_PORT = int(os.environ.get("ZENPOOL_NODE_PORT", 5052))
@@ -90,10 +90,27 @@ class KeyPool:
         k["last_used"] = now
         return {"id": kid, "key": k["key"], "label": k["label"], "source": "local"}
 
+    def _pick_any_active_key(self, now):
+        """Pick any active key (ignore hub cooldown — for node IP execution)."""
+        active = [k for k, v in self.keys.items() if v["active"]]
+        if not active:
+            return None
+        self._rr = (self._rr + 1) % len(active)
+        kid = active[self._rr]
+        k = self.keys[kid]
+        k["total"] += 1
+        k["last_used"] = now
+        return {"id": kid, "key": k["key"], "label": k["label"], "source": "node-key"}
+
     def get_key(self):
         """Round-robin across non-cooled keys (local pool only)."""
         with self._lock:
             return self._pick_local_key(time.time())
+
+    def get_key_for_node(self):
+        """Key for a node to use from its own IP (ignores hub-IP cooldowns)."""
+        with self._lock:
+            return self._pick_any_active_key(time.time())
 
     def _online_nodes(self, now=None):
         now = now or time.time()
@@ -117,10 +134,14 @@ class KeyPool:
         return {"id": f"node:{nid}", "nid": nid, "proxy_url": proxy_url,
                 "label": f"node-{nid}", "source": "node"}
 
-    def get_any_key(self):
+    def get_any_key(self, prefer_node=False):
         """Try local pool first, fall back to routing through an online node."""
         with self._lock:
             now = time.time()
+            if prefer_node:
+                route = self._pick_node_route(now)
+                if route:
+                    return route
             k = self._pick_local_key(now)
             if k:
                 return k
@@ -373,7 +394,7 @@ def run_hub():
                 nid = b.get("node_id")
                 if not nid or not pool.node_online(nid):
                     return self._e("unknown or offline node", 403)
-                k = pool.get_key()
+                k = pool.get_key_for_node()
                 if k:
                     self._s(k)
                 else:
@@ -459,28 +480,31 @@ def run_hub():
                 return False
 
         def _proxy(self, body, pool):
-            tried = set()
-            max_tries = max(len(pool.keys) + pool.active_node_count(), 1)
+            tried_local = set()
+            node_attempts = 0
+            max_node_attempts = max(pool.active_node_count() * 3, 3)
+            max_tries = max(len(pool.keys) + pool.active_node_count(), 1) * 2
             last_resp = None
             last_code = 503
             prefer_node = False
 
             for _ in range(max_tries):
-                if prefer_node:
-                    k = pool.pick_node()
-                    prefer_node = False
-                    if not k:
-                        k = pool.get_any_key()
-                else:
-                    k = pool.get_any_key()
-                if not k or k["id"] in tried:
+                k = pool.get_any_key(prefer_node=prefer_node)
+                prefer_node = False
+                if not k:
                     break
-                tried.add(k["id"])
 
                 if k.get("source") == "node":
+                    node_attempts += 1
+                    if node_attempts > max_node_attempts:
+                        break
                     if self._dispatch_via_node(body, k):
                         return
                     continue
+
+                if k["id"] in tried_local:
+                    break
+                tried_local.add(k["id"])
 
                 req = urllib.request.Request(
                     ZEN_API,
