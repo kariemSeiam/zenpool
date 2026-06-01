@@ -1,75 +1,62 @@
-# 🐍 ZenPool
+# ZenPool 🐍
 
-**Distributed API key pool for OpenCode Zen — never stop.**  
-One endpoint. Any number of keys. Zero-config nodes that auto-donate.
+Distributed API key pool for OpenCode Zen. Pool keys across any number of machines — never hit a rate limit again.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.sh | bash
+curl -fsSL https://srv880434.hstgr.cloud/zenpool.py | python3 - node
 ```
 
 ---
 
-## The Main Thing
+## How it works
 
 ```
-                         ┌──────────────────────────────┐
-                         │   https://srv880434.hstgr.cloud  │
-                         │       /v1/chat/completions    │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │            HUB               │
-                         │  ┌────────────────────────┐  │
-                         │  │   Local keys (primary)  │  │
-                         │  │   Node keys (fallback)  │  │
-                         │  └────────────────────────┘  │
-                         └──────────────┬───────────────┘
-                                        │
-          ┌─────────────────────────────┼─────────────────────────────┐
-          ▼                             ▼                             ▼
-   ┌──────────────┐            ┌──────────────┐            ┌──────────────┐
-   │   Node A     │            │   Node B     │            │   Node C     │
-   │  --key sk-1  │            │  --key sk-2  │            │  no key      │
-   │   ↓          │            │   ↓          │            │   (borrows)  │
-   │ auto-donates │            │ auto-donates │            └──────────────┘
-   │ to hub pool  │            │ to hub pool  │
-   └──────────────┘            └──────────────┘
+  Your client
+      │
+      ▼
+  ┌───────────────────────────────────────┐
+  │  HUB  https://srv880434.hstgr.cloud  │
+  │                                       │
+  │  local keys → round-robin             │
+  │  node keys  → fallback pool           │
+  │  rate-limited key → exponential cool  │
+  └───────────────┬───────────────────────┘
+                  │
+      ┌───────────┼───────────┐
+      ▼           ▼           ▼
+   Node A      Node B      Node C
+  --key sk-1  --key sk-2  (borrows)
 ```
 
-**You hit the hub → hub grabs the next fresh key from the pool → calls OpenCode → returns.**
-
-- Hub checks **local keys first** (round-robin)
-- If all local keys are in cooldown → falls through to **node-contributed keys**
-- When a key hits 429 → hub cools it (5m → 10m → 20m → ... → 1h)
-- When a node dies → hub removes its key from the pool
+- Hub checks local keys first (round-robin across non-cooled)
+- If all local keys are cooling → routes through an online node
+- 429 response → key enters exponential backoff (30s → 60s → 120s)
+- Node dies → hub removes it and its keys within 90s
+- All persistence: SQLite WAL — survives hard restarts
 
 ---
 
-## Quick Start
+## Install
 
-### 🚀 One-command (any OS)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.sh | bash
-```
-
-Auto-detects OS, downloads `zenpool.py`, sets up background service:
-
-| OS | Service | Survives reboot |
-|----|---------|-----------------|
-| Linux (root) | Systemd system service | ✅ |
-| Linux (user) | Systemd user service + linger | ✅ |
-| macOS | LaunchAgent | ✅ |
-| Windows | Scheduled Task | ✅ |
-| Termux | `.bashrc` auto-start | ✅ |
+### One command (any OS)
 
 ```bash
-# Node with key donation (contributes to hub fallback pool)
-curl -fsSL ... | bash -s -- --key sk-xxxxx
+# Node — joins the pool, optionally donates a key
+curl -fsSL https://srv880434.hstgr.cloud/zenpool.py | bash -s -- node --key sk-xxxxx
 
-# Hub server (manages the key pool)
-curl -fsSL ... | sudo bash -s -- --hub
+# Hub — manages the pool (run on your server)
+curl -fsSL https://srv880434.hstgr.cloud/zenpool.py | sudo bash -s -- hub
 ```
+
+The install script sets up a background service automatically:
+
+| Platform        | Service type              | Survives reboot |
+|-----------------|---------------------------|-----------------|
+| Linux (root)    | systemd system service    | ✅              |
+| Linux (user)    | systemd user + linger     | ✅              |
+| macOS           | LaunchAgent               | ✅              |
+| Windows         | Scheduled Task            | ✅              |
+| Termux          | `.bashrc` auto-start      | ✅              |
 
 ### Manual
 
@@ -77,55 +64,123 @@ curl -fsSL ... | sudo bash -s -- --hub
 # Hub
 python3 zenpool.py hub
 
-# Node (auto-connects to default hub)
+# Node (connects to default hub)
 python3 zenpool.py node
 
 # Node with key donation
 python3 zenpool.py node --key sk-your-key-here
+
+# Node pointing at a custom hub
+python3 zenpool.py node --hub http://192.168.1.10:5051 --key sk-your-key-here
+
+# Node with explicit public URL (for Tailscale / NAT traversal)
+python3 zenpool.py node --public-url http://100.x.x.x:5052
 ```
 
-### API usage
+---
+
+## Use it
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="https://srv880434.hstgr.cloud/v1",
-    api_key="ignored"
+    api_key="ignored",
 )
+
+response = client.chat.completions.create(
+    model="big-pickle",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+```bash
+curl https://srv880434.hstgr.cloud/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ---
 
-## Key Features
+## Environment variables
 
-| Feature | What it does |
-|---------|-------------|
-| **Round-robin** | Distributes across all non-cooled keys |
-| **Exponential backoff** | 5m → 10m → 20m → 40m → 1h on 429 |
-| **Node key donation** | Every `--key` on any device auto-feeds the hub fallback pool |
-| **Fallback pool** | When local keys are dry, hub uses node-contributed keys |
-| **Auto-pruning** | Dead nodes → their keys leave the pool (90s timeout) |
-| **Cross-platform install** | Linux, macOS, Windows, Termux — one command |
-| **Background service** | systemd / launchd / scheduled task |
-| **Zero dependencies** | Python stdlib only (3.8+) |
-| **Concurrent** | ThreadingHTTPServer handles parallel requests |
+| Variable                  | Default                              | Description                          |
+|---------------------------|--------------------------------------|--------------------------------------|
+| `ZENPOOL_HUB`             | `https://srv880434.hstgr.cloud`      | Hub URL (node mode)                  |
+| `ZENPOOL_PORT`            | `5051`                               | Hub listen port                      |
+| `ZENPOOL_NODE_PORT`       | `5052`                               | Node listen port                     |
+| `ZENPOOL_DATA`            | `zenpool.db`                         | SQLite database path (hub)           |
+| `ZENPOOL_SECRET`          | *(empty)*                            | Shared secret — enables auth         |
+| `ZENPOOL_REQUIRE_AUTH`    | `1`                                  | Enforce auth when secret is set      |
+| `ZENPOOL_MAX_BODY`        | `10485760`                           | Max request body size (bytes)        |
+| `ZENPOOL_NODE_MAX_WORKERS`| `8`                                  | Concurrent hub-work threads per node |
+| `ZENPOOL_PUBLIC_URL`      | *(auto)*                             | Node's reachable URL                 |
+| `ZENPOOL_STATE`           | platform state dir                   | Node state directory                 |
 
-## Endpoints
+---
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Hub status + key/node counts |
-| GET | `/keys` | All local keys + cooldown status |
-| POST | `/keys` | Add a key to the pool |
-| DELETE | `/keys/<id>` | Remove a key |
-| POST | `/next-key` | Get next available key (round-robin) |
-| POST | `/report` | Report success/failure for a key |
-| POST | `/register` | Node registration (auto-sends `--key`) |
-| POST | `/heartbeat` | Node heartbeat (30s interval) |
-| POST | `/v1/chat/completions` | **Direct proxy — main endpoint** |
-| GET | `/v1/models` | Available models |
-| GET | `/nodes` | List registered nodes |
+## Hub API
+
+| Method   | Path                        | Auth   | Description                                    |
+|----------|-----------------------------|--------|------------------------------------------------|
+| `GET`    | `/health`                   | open   | Hub status, key/node counts, tokens in-flight  |
+| `GET`    | `/status`                   | open   | Full detail: per-key stats, per-node stats     |
+| `GET`    | `/metrics`                  | open   | Prometheus text format                         |
+| `GET`    | `/v1/models`                | open   | Available models list                          |
+| `POST`   | `/v1/chat/completions`      | open   | **Main proxy endpoint**                        |
+| `GET`    | `/keys`                     | secret | All keys (masked) + cooldown state             |
+| `POST`   | `/keys`                     | secret | Add key — body: `{"key": "sk-...", "label": ""}` |
+| `DELETE` | `/keys/<id>`                | secret | Remove a key                                   |
+| `POST`   | `/keys/<id>/reactivate`     | secret | Reactivate a key that hit the error threshold  |
+| `GET`    | `/nodes`                    | secret | All registered nodes                           |
+| `DELETE` | `/nodes/<id>`               | secret | Remove a node                                  |
+| `POST`   | `/register`                 | open   | Node registration — returns `node_id` + `token` |
+| `POST`   | `/heartbeat`                | token  | Node heartbeat (30s interval)                  |
+| `POST`   | `/next-key`                 | token  | Node requests a key from the hub pool          |
+| `POST`   | `/report`                   | token  | Node reports key success/failure               |
+| `POST`   | `/poll-work`                | token  | Node polls for hub-assigned work (NAT-safe)    |
+| `POST`   | `/complete-work`            | token  | Node returns completed work result             |
+
+**Auth header:** `Authorization: Bearer <ZENPOOL_SECRET>`
+
+---
+
+## Security
+
+- **SSRF protection** — node proxy URLs are validated against blocked RFC-1918 / loopback ranges before any outbound connection
+- **Key masking** — API keys are never returned in full via the API (`sk-ab...cdef`)
+- **Node tokens** — each registered node gets an HMAC token; heartbeat/poll-work/next-key verify it when `ZENPOOL_SECRET` is set
+- **Required auth** — set `ZENPOOL_SECRET` to lock down key management endpoints
+
+---
+
+## Persistence & reliability
+
+- SQLite WAL mode — concurrent reads, atomic writes, crash-safe
+- Automatic migration from `zenpool-data.json` on first start
+- Node state persists across restarts (node ID + token stored locally)
+- Public IP refreshed every 15s via `checkip.amazonaws.com`
+- Dead nodes pruned after 90s; pending work cancelled immediately
+
+---
+
+## Models
+
+| ID                       | Notes              |
+|--------------------------|--------------------|
+| `big-pickle`             | Default            |
+| `deepseek-v4-flash-free` | Fast, free tier    |
+| `deepseek-v4-pro`        | Pro tier           |
+| `nemotron-3-super-free`  | Free tier          |
+| `mimo-v2.5-free`         | Free tier          |
+
+---
+
+## Requirements
+
+- Python 3.10+ (stdlib only — `sqlite3` is included)
+- No pip installs needed
 
 ---
 
