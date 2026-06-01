@@ -1,11 +1,81 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────────
-#  🐍 ZenPool Installer v2 — Cross-platform, zero-dependency, premium
+#  🐍 ZenPool Installer v2 — Dual-Shell (bash + PowerShell)
 #  Usage:
-#    curl -fsSL "https://raw.githubusercontent.com/kariemSeiam/zenpool/master/install.sh?v=2.1.8" | bash
-#    curl -fsSL ... | bash -s -- --hub            # install as hub server
-#    curl -fsSL ... | bash -s -- --key sk-xxx     # optional: local key override on node
+#    bash:     curl -fsSL <url>/install.sh | bash
+#    PowerShell:  iwr -Uri <url>/install.sh | iex
 # ──────────────────────────────────────────────────────────────────────
+#  Python bridge detects PowerShell and runs native install.
+#  In bash: Python exits 1, continues to normal installer below.
+#  In PowerShell: Python runs the full install, then (return 0) exits iex.
+# ──────────────────────────────────────────────────────────────────────
+
+python3 -c "
+import os, sys, urllib.request, json
+
+# ── Shell detection ────────────────────────────────────────────────
+# $SHELL is always set in bash/zsh, never in PowerShell (via iex).
+if os.environ.get('SHELL'):
+    sys.exit(1)  # bash — let bash handle the install below
+
+# ── PowerShell detected — run native install ───────────────────────
+VERSION = '2.1.10'
+HUB = os.environ.get('ZENPOOL_HUB', 'https://srv880434.hstgr.cloud')
+REPO = 'https://raw.githubusercontent.com/kariemSeiam/zenpool/master'
+
+import os.path
+
+# Install to %LOCALAPPDATA%/zenpool or equivalent
+if sys.platform == 'win32':
+    base = os.environ.get('LOCALAPPDATA', os.path.join(os.environ['USERPROFILE'], 'AppData', 'Local'))
+else:
+    base = os.path.expanduser('~/.local/share')
+install_dir = os.path.join(base, 'zenpool')
+os.makedirs(install_dir, exist_ok=True)
+
+# Download zenpool.py
+print()
+print('  🐍 ZenPool Node Install (PowerShell)')
+print()
+script = None
+for url in [REPO + '/zenpool.py']:
+    try:
+        resp = urllib.request.urlopen(url, timeout=30)
+        script = resp.read().decode()
+        if 'VERSION' in script:
+            break
+    except Exception:
+        continue
+
+if not script:
+    print('  Download failed — check internet')
+    sys.exit(1)
+
+script_path = os.path.join(install_dir, 'zenpool.py')
+with open(script_path, 'w', encoding='utf-8') as f:
+    f.write(script)
+print(f'  Downloaded: {script_path}')
+
+# Add Windows startup entry
+startup = os.path.join(os.environ['USERPROFILE'], 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+if os.path.isdir(startup):
+    with open(os.path.join(startup, 'zenpool-node.cmd'), 'w') as f:
+        f.write(f'@start /b python \"{script_path}\" node --hub {HUB}')
+    print('  Startup: zenpool-node.cmd created')
+
+print()
+print('  ✅ ZenPool Node installed (PowerShell)')
+print(f'  Run: python \"{script_path}\" node --hub {HUB}')
+print()
+sys.exit(0)
+" 2>/dev/null
+
+# If we reach here in PowerShell, Python completed the install above.
+# (return 0) below exits iex cleanly.  In bash the subshell return is
+# a harmless no-op (subshell exits 0, main script continues).
+(return 0) 2>/dev/null
+
+# ─── Normal bash installer continues below ────────────────────────
 set -euo pipefail
 
 # ─── ANSI ────────────────────────────────────────────────────────────
