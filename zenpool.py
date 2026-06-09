@@ -233,15 +233,40 @@ if ($PublicUrl) { $nodeArgs += @("--public-url", $PublicUrl) }
 
 $taskName = "ZenPoolNode"
 $argString = ($nodeArgs | ForEach-Object { if ($_ -match "\s") { "`"$_`"" } else { $_ } }) -join " "
-$action = New-ScheduledTaskAction -Execute $pyPath -Argument "`"$DataDir\zenpool.py`" $argString"
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 0)
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+$taskArg = "`"$DataDir\zenpool.py`" $argString"
+$action = New-ScheduledTaskAction -Execute $pyPath -Argument $taskArg
 
-try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "ZenPool Node — auto-start at logon" | Out-Null
-Start-ScheduledTask -TaskName $taskName
-Write-Host "  ✓ scheduled task: $taskName (starts at logon, started now)"
+# Try proper service first (nssm) → fall back to Scheduled Task (AtStartup + SYSTEM)
+$nssm = Get-Command nssm -ErrorAction SilentlyContinue
+if ($nssm) {
+    # nssm — proper Windows service, starts at boot, survives everything
+    $serviceName = "ZenPoolNode"
+    $nssmPath = $nssm.Source
+    & $nssmPath stop $serviceName 2>&1 | Out-Null
+    & $nssmPath remove $serviceName confirm 2>&1 | Out-Null
+    & $nssmPath install $serviceName $pyPath "$DataDir\zenpool.py" $nodeArgs
+    & $nssmPath set $serviceName AppStdout "$DataDir\zenpool.log"
+    & $nssmPath set $serviceName AppStderr "$DataDir\zenpool.log"
+    & $nssmPath set $serviceName Start SERVICE_AUTO_START
+    & $nssmPath set $serviceName AppRestartDelay 5000
+    & $nssmPath start $serviceName
+    Write-Host "  ✓ nssm service: $serviceName (starts at boot, auto-restart)"
+} else {
+    # Scheduled Task — AtStartup + SYSTEM = no login needed, survives reboot
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit 0 `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName 2>&1 | Out-Null
+    Write-Host "  ✓ scheduled task: $taskName (SYSTEM, at startup, auto-restart)"
+}
 
 Start-Sleep -Seconds 1
 Write-Host
