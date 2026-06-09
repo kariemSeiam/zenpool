@@ -1,597 +1,518 @@
 #!/usr/bin/env python3
-"""zenpool — Unified API key pool & distributed proxy for OpenCode Zen.
+"""zenpool — LLM gateway for the HVAR/Tabula stack.
 
-One file, two modes:
-  python3 zenpool.py hub         → Run the central hub (on your main server)
-  python3 zenpool.py node        → Run a node agent (on any device)
-  python3 zenpool.py node --hub http://x:5051  → Connect to specific hub
+One model, one job: serve Big Pickle, always, reliably. OpenAI-compatible.
+  python3 zenpool.py hub         → Run the gateway (single instance per env)
+  python3 zenpool.py node        → Run a node agent (NAT-safe egress; WIP)
 
-Install: curl -fsSL https://srv880434.hstgr.cloud/zenpool.py | python3 - node
-Windows: (Invoke-WebRequest -Uri https://srv880434.hstgr.cloud/zenpool.py).Content | python - node
+Gateway identity is fixed: every /v1/chat/completions request is forced to
+model=big-pickle regardless of caller input. Pool health uses decay+probe
+(no permadeath). Admin/data-plane split: mutating endpoints are localhost-only.
 """
-import hashlib
-import ipaddress
 import json
 import os
 import platform
-import signal
-import sqlite3
-import sys
 import threading
 import time
 import uuid
 import urllib.error
 import urllib.request
-import urllib.parse
-from contextlib import contextmanager
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from hashlib import sha256
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-VERSION = "3.1.0"
+VERSION = "2.3.0"
+GATEWAY_MODEL = "big-pickle"
+DECAY_INTERVAL = 60          # error counters decay every minute
+DECAY_HALFLIFE = 15 * 60     # errors halve every 15 minutes
+PROBE_INTERVAL = 5 * 60      # probe cool keys every 5 minutes
+PROBE_BODY = {"model": GATEWAY_MODEL, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
+ADMIN_LOCAL_ONLY = True      # admin/data-plane split: mutating routes localhost-only
 DEFAULT_HUB = os.environ.get("ZENPOOL_HUB", "https://srv880434.hstgr.cloud")
 HUB_PORT = int(os.environ.get("ZENPOOL_PORT", 5051))
 NODE_PORT = int(os.environ.get("ZENPOOL_NODE_PORT", 5052))
-DATA_FILE = os.environ.get("ZENPOOL_DATA", "zenpool.db")
+
+def _default_data_dir():
+    """OS-appropriate user data dir. Linux: $XDG_DATA_HOME or ~/.local/share.
+    macOS: ~/Library/Application Support. Windows: %LOCALAPPDATA%."""
+    sysname = platform.system()
+    if sysname == "Windows":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    elif sysname == "Darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "zenpool")
+
+_DATA_DIR = os.environ.get("ZENPOOL_DATA_DIR", _default_data_dir())
+try:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+except OSError:
+    _DATA_DIR = os.getcwd()
+DATA_FILE = os.environ.get("ZENPOOL_DATA", os.path.join(_DATA_DIR, "zenpool-data.json"))
 HEARTBEAT_INTERVAL = 30
 POLL_INTERVAL = 1
 WORK_TIMEOUT = 120
 PUSH_TIMEOUT = 4
 PULL_TIMEOUT = 90
-MAX_BODY = int(os.environ.get("ZENPOOL_MAX_BODY", 10 * 1024 * 1024))
-AUTH_SECRET = os.environ.get("ZENPOOL_SECRET", "")
-REQUIRE_AUTH = os.environ.get("ZENPOOL_REQUIRE_AUTH", "1") == "1"
 ZEN_API = "https://opencode.ai/zen/v1/chat/completions"
+SELF_PATH = os.path.abspath(__file__)
 
-BLOCKED_NETWORKS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
+INSTALL_SH = r'''#!/bin/sh
+# zenpool — universal installer for Linux / macOS
+# Usage:  curl -fsSL <HUB>/install.sh | sh
+#         curl -fsSL <HUB>/install.sh | sh -s -- --hub https://my.hub --key sk-xxx
+set -eu
 
+HUB="${ZENPOOL_HUB:-__HUB_URL__}"
+KEY="${ZENPOOL_KEY:-}"
+MODE="node"
+PUBLIC_URL="${ZENPOOL_PUBLIC_URL:-}"
 
-# ─── Cross-platform state directory ──────────────────────────────────
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hub) HUB="$2"; shift 2 ;;
+    --key) KEY="$2"; shift 2 ;;
+    --public-url) PUBLIC_URL="$2"; shift 2 ;;
+    --hub-mode) MODE="hub"; shift ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
-def _default_state_dir() -> str:
-    system = platform.system()
-    if system == "Windows":
-        base = os.environ.get("LOCALAPPDATA",
-                              os.path.join(os.path.expanduser("~"), "AppData", "Local"))
-        return os.path.join(base, "zenpool")
-    if system == "Darwin":
-        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "zenpool")
-    xdg = os.environ.get("XDG_DATA_HOME")
-    if xdg:
-        return os.path.join(xdg, "zenpool")
-    return os.path.join(os.path.expanduser("~"), ".local", "share", "zenpool")
+OS="$(uname -s)"
+case "$OS" in
+  Linux)  DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zenpool" ;;
+  Darwin) DATA_DIR="$HOME/Library/Application Support/zenpool" ;;
+  *)      DATA_DIR="$HOME/.zenpool" ;;
+esac
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$DATA_DIR" "$BIN_DIR"
 
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "❌ python3 not found. Install python 3.7+ and retry." >&2
+  exit 1
+fi
 
-# ─── Graceful shutdown ───────────────────────────────────────────────
+echo "  🥒 zenpool installer"
+echo "     hub:  $HUB"
+echo "     dir:  $DATA_DIR"
+echo "     py:   $PY"
 
-shutting_down = False
-_work_queue_for_shutdown = None
+echo "  ⤵  fetching zenpool.py"
+curl -fsSL "$HUB/zenpool.py" -o "$DATA_DIR/zenpool.py"
+chmod +x "$DATA_DIR/zenpool.py"
 
+cat > "$BIN_DIR/zenpool" <<EOF
+#!/bin/sh
+exec "$PY" "$DATA_DIR/zenpool.py" "\$@"
+EOF
+chmod +x "$BIN_DIR/zenpool"
+echo "  ✓ wrapper: $BIN_DIR/zenpool"
 
-def _handle_signal(signum, frame):
-    global shutting_down
-    if shutting_down:
-        sys.exit(1)
-    shutting_down = True
-    name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-    print(f"\n  ␡ {name} received — shutting down gracefully...")
-    wq = _work_queue_for_shutdown
-    if wq is not None:
-        with wq._lock:
-            for item in wq._pending.values():
-                item["event"].set()
-            wq._pending.clear()
-        print("  ✓ Cancelled pending work items")
-    sys.exit(0)
+if [ "$MODE" = "hub" ]; then
+  echo "  ▶ starting in hub mode (foreground): zenpool hub"
+  exec "$BIN_DIR/zenpool" hub
+fi
 
+ARGS="node --hub $HUB"
+[ -n "$KEY" ] && ARGS="$ARGS --key $KEY"
+[ -n "$PUBLIC_URL" ] && ARGS="$ARGS --public-url $PUBLIC_URL"
 
-try:
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-except (AttributeError, ValueError, OSError):
-    pass
+if [ "$OS" = "Darwin" ]; then
+  PLIST="$HOME/Library/LaunchAgents/ai.zenpool.node.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>ai.zenpool.node</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PY</string><string>$DATA_DIR/zenpool.py</string><string>node</string>
+    <string>--hub</string><string>$HUB</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$DATA_DIR/zenpool.log</string>
+  <key>StandardErrorPath</key><string>$DATA_DIR/zenpool.log</string>
+</dict></plist>
+EOF
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load "$PLIST"
+  echo "  ✓ launchd service: ai.zenpool.node"
+elif command -v systemctl >/dev/null 2>&1; then
+  UNIT_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/zenpool-node.service" <<EOF
+[Unit]
+Description=ZenPool Node
+After=network-online.target
 
+[Service]
+Type=simple
+ExecStart=$PY $DATA_DIR/zenpool.py $ARGS
+Restart=always
+RestartSec=5
 
-# ─── Security utilities ──────────────────────────────────────────────
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now zenpool-node.service
+  loginctl enable-linger "$USER" 2>/dev/null || true
+  echo "  ✓ systemd user service: zenpool-node"
+  echo "     logs:  journalctl --user -u zenpool-node -f"
+else
+  echo "  ⚠  no systemd/launchd — starting in background via nohup"
+  nohup "$BIN_DIR/zenpool" $ARGS > "$DATA_DIR/zenpool.log" 2>&1 &
+  echo "     pid: $!"
+  echo "     log: $DATA_DIR/zenpool.log"
+fi
 
-def validate_proxy_url(url: str) -> tuple[bool, str]:
-    """Block SSRF targets in node proxy URLs."""
-    if not url:
-        return True, ""
-    try:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False, f"invalid scheme: {parsed.scheme}"
-        host = parsed.hostname
-        if not host:
-            return False, "missing hostname"
-        try:
-            ip = ipaddress.ip_address(host)
-            for net in BLOCKED_NETWORKS:
-                if ip in net:
-                    return False, f"blocked network: {net}"
-        except ValueError:
-            if host in ("localhost", "localhost.localdomain"):
-                return False, "localhost blocked"
-            if host.endswith((".local", ".internal")):
-                return False, "internal domain blocked"
-        return True, ""
-    except Exception as e:
-        return False, str(e)
+sleep 1
+echo
+echo "  ✅ zenpool node installed"
+echo "     check: curl -s http://localhost:5052/health"
+echo "     hub:   $HUB/health"
+'''
 
+INSTALL_PS1 = r'''# zenpool — universal installer for Windows (PowerShell)
+# Usage:  irm <HUB>/install.ps1 | iex
+#         & ([scriptblock]::Create((irm <HUB>/install.ps1))) -Hub https://my.hub -Key sk-xxx
+param(
+    [string]$Hub = $env:ZENPOOL_HUB,
+    [string]$Key = $env:ZENPOOL_KEY,
+    [string]$PublicUrl = $env:ZENPOOL_PUBLIC_URL,
+    [switch]$HubMode
+)
+$ErrorActionPreference = "Stop"
+if (-not $Hub) { $Hub = "__HUB_URL__" }
 
-def mask_key(key: str) -> str:
-    if len(key) <= 8:
-        return "***"
-    return f"{key[:4]}...{key[-4:]}"
+$DataDir = Join-Path $env:LOCALAPPDATA "zenpool"
+$BinDir  = Join-Path $env:LOCALAPPDATA "Programs\zenpool"
+New-Item -ItemType Directory -Force -Path $DataDir, $BinDir | Out-Null
 
+$py = (Get-Command python3 -ErrorAction SilentlyContinue) ?? (Get-Command python -ErrorAction SilentlyContinue) ?? (Get-Command py -ErrorAction SilentlyContinue)
+if (-not $py) {
+    Write-Error "❌ Python 3 not found. Install from https://python.org/downloads and re-run."
+}
+$pyPath = $py.Source
 
-def generate_node_token(node_id: str, secret: str) -> str:
-    return hashlib.sha256(f"{node_id}:{secret}".encode()).hexdigest()[:32]
+Write-Host "  🥒 zenpool installer"
+Write-Host "     hub:  $Hub"
+Write-Host "     dir:  $DataDir"
+Write-Host "     py:   $pyPath"
 
+Write-Host "  ⤵  fetching zenpool.py"
+Invoke-WebRequest -UseBasicParsing "$Hub/zenpool.py" -OutFile (Join-Path $DataDir "zenpool.py")
 
-def verify_node_token(node_id: str, token: str, secret: str) -> bool:
-    return token == generate_node_token(node_id, secret)
+$wrapper = Join-Path $BinDir "zenpool.cmd"
+@"
+@echo off
+"$pyPath" "$DataDir\zenpool.py" %*
+"@ | Set-Content -Encoding ASCII $wrapper
+Write-Host "  ✓ wrapper: $wrapper"
 
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$BinDir*") {
+    [Environment]::SetEnvironmentVariable("Path", "$userPath;$BinDir", "User")
+    Write-Host "  ✓ added $BinDir to user PATH (restart shell to use 'zenpool')"
+}
 
-# ─── RWLock ──────────────────────────────────────────────────────────
+if ($HubMode) {
+    Write-Host "  ▶ starting in hub mode (foreground): zenpool hub"
+    & $pyPath (Join-Path $DataDir "zenpool.py") hub
+    return
+}
 
-class RWLock:
-    """Multiple readers OR single writer."""
+$nodeArgs = @("node", "--hub", $Hub)
+if ($Key)       { $nodeArgs += @("--key", $Key) }
+if ($PublicUrl) { $nodeArgs += @("--public-url", $PublicUrl) }
 
-    def __init__(self):
-        self._cond = threading.Condition(threading.Lock())
-        self._readers = 0
-        self._writers_waiting = 0
-        self._writer_active = False
+$taskName = "ZenPoolNode"
+$argString = ($nodeArgs | ForEach-Object { if ($_ -match "\s") { "`"$_`"" } else { $_ } }) -join " "
+$action = New-ScheduledTaskAction -Execute $pyPath -Argument "`"$DataDir\zenpool.py`" $argString"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 0)
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-    @contextmanager
-    def read(self):
-        with self._cond:
-            while self._writer_active or self._writers_waiting > 0:
-                self._cond.wait()
-            self._readers += 1
-        try:
-            yield
-        finally:
-            with self._cond:
-                self._readers -= 1
-                if self._readers == 0:
-                    self._cond.notify_all()
+try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "ZenPool Node — auto-start at logon" | Out-Null
+Start-ScheduledTask -TaskName $taskName
+Write-Host "  ✓ scheduled task: $taskName (starts at logon, started now)"
 
-    @contextmanager
-    def write(self):
-        with self._cond:
-            self._writers_waiting += 1
-            while self._readers > 0 or self._writer_active:
-                self._cond.wait()
-            self._writers_waiting -= 1
-            self._writer_active = True
-        try:
-            yield
-        finally:
-            with self._cond:
-                self._writer_active = False
-                self._cond.notify_all()
-
-
-# ─── SQLite Storage ──────────────────────────────────────────────────
-
-class Storage:
-    """SQLite WAL-mode persistence. Thread-local connections for safety."""
-
-    def __init__(self, path: str = DATA_FILE):
-        self.path = path
-        self._local = threading.local()
-        self._init_db()
-
-    def _conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn"):
-            conn = sqlite3.connect(self.path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn = conn
-        return self._local.conn
-
-    def _init_db(self):
-        c = self._conn()
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS keys (
-                id TEXT PRIMARY KEY,
-                key TEXT NOT NULL,
-                label TEXT DEFAULT '',
-                active INTEGER DEFAULT 1,
-                cool_until REAL DEFAULT 0,
-                total INTEGER DEFAULT 0,
-                errors INTEGER DEFAULT 0,
-                tokens_input INTEGER DEFAULT 0,
-                tokens_output INTEGER DEFAULT 0,
-                last_used REAL DEFAULT 0,
-                created_at REAL DEFAULT (strftime('%s','now'))
-            );
-            CREATE TABLE IF NOT EXISTS nodes (
-                id TEXT PRIMARY KEY,
-                name TEXT DEFAULT '',
-                ip TEXT DEFAULT '',
-                device TEXT DEFAULT '',
-                proxy_url TEXT DEFAULT '',
-                token TEXT DEFAULT '',
-                key TEXT DEFAULT '',
-                seen REAL DEFAULT 0,
-                total INTEGER DEFAULT 0,
-                in_flight INTEGER DEFAULT 0,
-                uptime INTEGER DEFAULT 0,
-                tokens_proxied INTEGER DEFAULT 0,
-                public_ip TEXT DEFAULT '',
-                created_at REAL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_keys_cool ON keys(active, cool_until);
-            CREATE INDEX IF NOT EXISTS idx_nodes_seen ON nodes(seen);
-        """)
-        c.commit()
-
-    def migrate_json(self, json_path: str):
-        """One-time import from zenpool-data.json."""
-        if not os.path.exists(json_path):
-            return
-        try:
-            with open(json_path) as f:
-                d = json.load(f)
-            c = self._conn()
-            for kid, kv in d.get("keys", {}).items():
-                c.execute(
-                    "INSERT OR IGNORE INTO keys "
-                    "(id, key, label, active, cool_until, total, errors, tokens_input, tokens_output) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (kid, kv.get("key", ""), kv.get("label", kid[:8]),
-                     1 if kv.get("active", True) else 0,
-                     kv.get("cool_until", 0), kv.get("total", 0), kv.get("errors", 0),
-                     kv.get("tokens_input", 0), kv.get("tokens_output", 0)),
-                )
-            for nid, nv in d.get("nodes", {}).items():
-                c.execute(
-                    "INSERT OR IGNORE INTO nodes (id, name, ip, device, proxy_url, key, seen, total) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (nid, nv.get("name", ""), nv.get("ip", ""), nv.get("device", ""),
-                     nv.get("proxy_url", ""), nv.get("key", ""),
-                     nv.get("seen", 0), nv.get("total", 0)),
-                )
-            c.commit()
-            os.rename(json_path, json_path + ".migrated")
-            print(f"  ✓ Migrated {json_path} → SQLite")
-        except Exception as e:
-            print(f"  ⚠️  Migration failed: {e}", file=sys.stderr)
-
-    # ── Keys ─────────────────────────────────────────────────────────
-
-    def add_key(self, key: str, label: str = "") -> str:
-        kid = hashlib.sha256(key.encode()).hexdigest()[:12]
-        c = self._conn()
-        c.execute("INSERT OR IGNORE INTO keys (id, key, label) VALUES (?, ?, ?)",
-                  (kid, key, label or kid[:8]))
-        c.commit()
-        return kid
-
-    def get_key(self, kid: str) -> dict | None:
-        row = self._conn().execute("SELECT * FROM keys WHERE id = ?", (kid,)).fetchone()
-        return dict(row) if row else None
-
-    def get_active_keys(self) -> list[dict]:
-        rows = self._conn().execute(
-            "SELECT * FROM keys WHERE active = 1 AND cool_until < ?", (time.time(),)).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_all_active_keys(self) -> list[dict]:
-        rows = self._conn().execute("SELECT * FROM keys WHERE active = 1").fetchall()
-        return [dict(r) for r in rows]
-
-    def peek_active_key(self) -> dict | None:
-        row = self._conn().execute(
-            "SELECT * FROM keys WHERE active = 1 AND cool_until < ? LIMIT 1",
-            (time.time(),)).fetchone()
-        return dict(row) if row else None
-
-    def list_keys(self, include_secret: bool = False) -> dict[str, dict]:
-        now = time.time()
-        rows = self._conn().execute("SELECT * FROM keys").fetchall()
-        result = {}
-        for row in rows:
-            d = dict(row)
-            if not include_secret:
-                d["key"] = mask_key(d["key"])
-            d["cool"] = d["cool_until"] > now
-            d["cool_remaining"] = max(0, int(d["cool_until"] - now))
-            result[d["id"]] = d
-        return result
-
-    def update_key(self, kid: str, **kwargs):
-        if not kwargs:
-            return
-        c = self._conn()
-        sets = ", ".join(f"{k} = ?" for k in kwargs)
-        c.execute(f"UPDATE keys SET {sets} WHERE id = ?", (*kwargs.values(), kid))
-        c.commit()
-
-    def remove_key(self, kid: str):
-        c = self._conn()
-        c.execute("DELETE FROM keys WHERE id = ?", (kid,))
-        c.commit()
-
-    def key_count(self) -> int:
-        return self._conn().execute("SELECT COUNT(*) FROM keys").fetchone()[0]
-
-    # ── Nodes ────────────────────────────────────────────────────────
-
-    def upsert_node(self, nid: str, **kwargs) -> str:
-        c = self._conn()
-        if c.execute("SELECT id FROM nodes WHERE id = ?", (nid,)).fetchone():
-            if kwargs:
-                sets = ", ".join(f"{k} = ?" for k in kwargs)
-                c.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*kwargs.values(), nid))
-        else:
-            kwargs["id"] = nid
-            cols = ", ".join(kwargs.keys())
-            placeholders = ", ".join("?" * len(kwargs))
-            c.execute(f"INSERT INTO nodes ({cols}) VALUES ({placeholders})",
-                      list(kwargs.values()))
-        c.commit()
-        return nid
-
-    def get_node(self, nid: str) -> dict | None:
-        row = self._conn().execute("SELECT * FROM nodes WHERE id = ?", (nid,)).fetchone()
-        return dict(row) if row else None
-
-    def get_online_nodes(self, timeout: int = 120) -> list[dict]:
-        cutoff = time.time() - timeout
-        rows = self._conn().execute(
-            "SELECT * FROM nodes WHERE seen > ?", (cutoff,)).fetchall()
-        return [dict(r) for r in rows]
-
-    def list_nodes(self) -> dict[str, dict]:
-        now = time.time()
-        rows = self._conn().execute("SELECT * FROM nodes").fetchall()
-        result = {}
-        for row in rows:
-            d = dict(row)
-            d["online"] = now - d.get("seen", 0) < 120
-            result[d["id"]] = d
-        return result
-
-    def remove_node(self, nid: str):
-        c = self._conn()
-        c.execute("DELETE FROM nodes WHERE id = ?", (nid,))
-        c.commit()
-
-    def prune_nodes(self, timeout: int = 90) -> list[str]:
-        cutoff = time.time() - timeout
-        rows = self._conn().execute(
-            "SELECT id FROM nodes WHERE seen < ?", (cutoff,)).fetchall()
-        dead = [r["id"] for r in rows]
-        if dead:
-            self._conn().execute("DELETE FROM nodes WHERE seen < ?", (cutoff,))
-            self._conn().commit()
-        return dead
-
-    def node_count(self) -> int:
-        return self._conn().execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+Start-Sleep -Seconds 1
+Write-Host
+Write-Host "  ✅ zenpool node installed"
+Write-Host "     check: irm http://localhost:5052/health"
+Write-Host "     hub:   $Hub/health"
+'''
 
 
-# ─── Connection cache ────────────────────────────────────────────────
 
-class ConnectionCache:
-    """Keep-alive opener pool keyed by host:port."""
-
-    def __init__(self, max_age: int = 30, max_entries: int = 10):
-        self._cache: dict[str, tuple] = {}
-        self._max_age = max_age
-        self._max_entries = max_entries
-        self._lock = threading.Lock()
-
-    def get_opener(self, host: str, port: int):
-        key = f"{host}:{port}"
-        with self._lock:
-            now = time.time()
-            entry = self._cache.get(key)
-            if entry and (now - entry[1]) < self._max_age:
-                self._cache[key] = (entry[0], now)
-                return entry[0]
-            opener = urllib.request.build_opener(urllib.request.HTTPHandler)
-            self._cache[key] = (opener, now)
-            self._evict(now)
-            return opener
-
-    def _evict(self, now: float):
-        stale = [k for k, v in self._cache.items() if (now - v[1]) > self._max_age]
-        for k in stale:
-            del self._cache[k]
-        if len(self._cache) > self._max_entries:
-            for k, _ in sorted(self._cache.items(),
-                                key=lambda x: x[1][1])[:len(self._cache) - self._max_entries]:
-                del self._cache[k]
-
-
-# ─── KeyPool ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  HUB
+# ═══════════════════════════════════════════════════════════════════════
 
 class KeyPool:
-    """SQLite-backed key pool with round-robin + exponential backoff."""
-
-    def __init__(self, storage: Storage):
-        self.storage = storage
-        self._rr = 0
-        self._rr_node = 0
-        self._rr_lock = threading.Lock()
-        self._lock = RWLock()
-        self._start = time.time()
-
-    def add_key(self, key: str, label: str = "") -> str:
-        return self.storage.add_key(key, label)
-
-    def remove_key(self, kid: str):
-        self.storage.remove_key(kid)
-
-    def _pick_from(self, keys: list[dict], source: str) -> dict | None:
-        if not keys:
-            return None
-        with self._rr_lock:
-            idx = self._rr % len(keys)
-            self._rr = (self._rr + 1) % max(len(keys), 1)
-        k = keys[idx]
-        self.storage.update_key(k["id"], total=k["total"] + 1, last_used=time.time())
-        return {"id": k["id"], "key": k["key"], "label": k["label"], "source": source}
-
-    def get_key(self) -> dict | None:
-        with self._lock.read():
-            keys = self.storage.get_active_keys()
-        return self._pick_from(keys, "local")
-
-    def get_key_for_node(self) -> dict | None:
-        with self._lock.read():
-            keys = self.storage.get_all_active_keys()
-        return self._pick_from(keys, "node-key")
-
-    def peek_key(self) -> dict | None:
-        row = self.storage.peek_active_key()
-        if not row:
-            return None
-        return {"id": row["id"], "key": row["key"], "label": row["label"], "source": "local"}
-
-    def _pick_node(self) -> dict | None:
-        nodes = self.storage.get_online_nodes()
-        if not nodes:
-            return None
-        with self._rr_lock:
-            idx = self._rr_node % len(nodes)
-            self._rr_node = (self._rr_node + 1) % max(len(nodes), 1)
-        n = nodes[idx]
-        self.storage.upsert_node(n["id"], total=n.get("total", 0) + 1)
-        return {
-            "id": f"node:{n['id']}", "nid": n["id"],
-            "proxy_url": n["proxy_url"], "label": f"node-{n['id']}", "source": "node",
-        }
-
-    def get_any_key(self, prefer_node: bool = False) -> dict | None:
-        if prefer_node:
-            route = self._pick_node()
-            if route:
-                return route
-        k = self.get_key()
-        if k:
-            return k
-        return self._pick_node()
-
-    def pick_node(self) -> dict | None:
-        return self._pick_node()
-
-    def active_node_count(self) -> int:
-        return len(self.storage.get_online_nodes())
-
-    def report_error(self, kid: str, code: int = 429):
-        k = self.storage.get_key(kid)
-        if not k:
-            return
-        errors = k["errors"] + 1
-        if code == 429:
-            backoff = min(30 * (2 ** min(errors - 1, 2)), 120)
-        elif code in (403, 503):
-            backoff = min(30 * errors, 90)
-        else:
-            backoff = min(300 * (2 ** min(errors - 1, 4)), 3600)
-        updates: dict = {"errors": errors, "cool_until": time.time() + backoff}
-        if errors >= 15:
-            updates["active"] = 0
-        self.storage.update_key(kid, **updates)
-
-    def report_ok(self, kid: str):
-        k = self.storage.get_key(kid)
-        if not k:
-            return
-        errors = max(0, k["errors"] - 1)
-        self.storage.update_key(kid, errors=errors,
-                                 cool_until=0 if errors == 0 else k["cool_until"])
-
-    def report_tokens(self, kid: str, prompt: int, completion: int):
-        k = self.storage.get_key(kid)
-        if not k:
-            return
-        self.storage.update_key(kid,
-                                  tokens_input=k["tokens_input"] + prompt,
-                                  tokens_output=k["tokens_output"] + completion)
-
-    def list_keys(self) -> dict:
-        return self.storage.list_keys(include_secret=False)
-
-    def register_node(self, name: str, ip: str, device: str,
-                      proxy_url: str, key: str | None = None,
-                      node_id: str | None = None) -> tuple[str, str]:
-        nid = node_id or str(uuid.uuid4())[:8]
-        secret = AUTH_SECRET or "zenpool-default"
-        token = generate_node_token(nid, secret)
-        valid, _ = validate_proxy_url(proxy_url)
-        if not valid:
-            proxy_url = f"http://{ip}:{NODE_PORT}"
-        self.storage.upsert_node(nid, name=name, ip=ip, device=device,
-                                   proxy_url=proxy_url, token=token,
-                                   key=key or "", seen=time.time())
-        return nid, token
-
-    def heartbeat(self, nid: str, in_flight: int = 0, uptime: int = 0,
-                  tokens_proxied: int = 0, public_ip: str = ""):
-        kwargs: dict = {"seen": time.time(), "in_flight": in_flight,
-                        "uptime": uptime, "tokens_proxied": tokens_proxied}
-        if public_ip:
-            kwargs["public_ip"] = public_ip
-        self.storage.upsert_node(nid, **kwargs)
-
-    def node_online(self, nid: str) -> bool:
-        n = self.storage.get_node(nid)
-        return bool(n and time.time() - n.get("seen", 0) < 120)
-
-    def verify_node(self, nid: str, token: str) -> bool:
-        n = self.storage.get_node(nid)
-        return bool(n and n.get("token") == token)
-
-    def list_nodes(self) -> dict:
-        now = time.time()
-        return {nid: {
-            "name": n.get("name", "?"), "ip": n.get("ip", "?"),
-            "device": n.get("device", "?"),
-            "online": now - n.get("seen", 0) < 60,
-            "public_ip": n.get("public_ip", ""),
-            "in_flight": n.get("in_flight", 0),
-            "uptime": n.get("uptime", 0),
-            "tokens_proxied": n.get("tokens_proxied", 0),
-        } for nid, n in self.storage.list_nodes().items()}
-
-    def remove_node(self, nid: str) -> bool:
-        if not self.storage.get_node(nid):
-            return False
-        self.storage.remove_node(nid)
-        return True
-
-    def prune(self, timeout: int = 90) -> list[str]:
-        return self.storage.prune_nodes(timeout)
-
-
-# ─── WorkQueue ───────────────────────────────────────────────────────
-
-class WorkQueue:
-    """Assign requests to nodes via hub polling (NAT-safe)."""
+    """Central key pool with round-robin + rate-limit backoff.
+    Falls through to node-contributed keys when local pool is dry.
+    """
 
     def __init__(self):
-        self._pending: dict = {}
+        self.keys = {}
+        self.nodes = {}  # nid -> {name, ip, device, seen, key?}
+        self._rr = 0
+        self._rr_node = 0
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(DATA_FILE) as f:
+                d = json.load(f)
+                self.keys = d.get("keys", {})
+                self.nodes = d.get("nodes", {})
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _save(self):
+        with open(DATA_FILE, "w") as f:
+            json.dump({"keys": self.keys, "nodes": self.nodes}, f, indent=2)
+
+    def add_key(self, value, label="", tier="pro"):
+        kid = sha256(value.encode()).hexdigest()[:12]
+        with self._lock:
+            if kid not in self.keys:
+                self.keys[kid] = {"key": value, "label": label or kid[:8], "tier": tier,
+                                  "active": True, "cool_until": 0, "total": 0, "errors": 0.0}
+                self._save()
+            else:
+                self.keys[kid]["tier"] = tier
+                self._save()
+            return kid
+
+    def remove_key(self, kid):
+        with self._lock:
+            self.keys.pop(kid, None)
+            self._save()
+
+    def _can_serve(self, k):
+        return k.get("tier", "pro") == "pro"
+
+    def _pick_local_key(self, now):
+        """Round-robin across non-cooled, capable local keys. Caller must hold self._lock."""
+        active = [k for k, v in self.keys.items() if v["active"] and v["cool_until"] < now and self._can_serve(v)]
+        if not active:
+            return None
+        self._rr = (self._rr + 1) % len(active)
+        kid = active[self._rr]
+        k = self.keys[kid]
+        k["total"] += 1
+        k["last_used"] = now
+        return {"id": kid, "key": k["key"], "label": k["label"], "source": "local"}
+
+    def _pick_any_active_key(self, now):
+        """Pick any active, capable key (ignore hub cooldown — for node IP execution)."""
+        active = [k for k, v in self.keys.items() if v["active"] and self._can_serve(v)]
+        if not active:
+            return None
+        self._rr = (self._rr + 1) % len(active)
+        kid = active[self._rr]
+        k = self.keys[kid]
+        k["total"] += 1
+        k["last_used"] = now
+        return {"id": kid, "key": k["key"], "label": k["label"], "source": "node-key"}
+
+    def get_key(self):
+        """Round-robin across non-cooled keys (local pool only)."""
+        with self._lock:
+            return self._pick_local_key(time.time())
+
+    def get_key_for_node(self):
+        """Key for a node to use from its own IP (ignores hub-IP cooldowns)."""
+        with self._lock:
+            return self._pick_any_active_key(time.time())
+
+    def _online_nodes(self, now=None):
+        now = now or time.time()
+        return [(nid, n) for nid, n in self.nodes.items() if now - n.get("seen", 0) < 120]
+
+    def node_online(self, nid):
+        with self._lock:
+            n = self.nodes.get(nid)
+            return bool(n and time.time() - n.get("seen", 0) < 120)
+
+    def _pick_node_route(self, now):
+        """Round-robin across online nodes. Caller must hold self._lock."""
+        active_nodes = self._online_nodes(now)
+        if not active_nodes:
+            return None
+        self._rr_node = (self._rr_node + 1) % len(active_nodes)
+        nid, n = active_nodes[self._rr_node]
+        n["total"] = n.get("total", 0) + 1
+        n["last_used"] = now
+        proxy_url = n.get("proxy_url") or f"http://{n.get('ip', '127.0.0.1')}:{NODE_PORT}"
+        return {"id": f"node:{nid}", "nid": nid, "proxy_url": proxy_url,
+                "label": f"node-{nid}", "source": "node"}
+
+    def get_any_key(self, prefer_node=False):
+        """Try local pool first, fall back to routing through an online node."""
+        with self._lock:
+            now = time.time()
+            if prefer_node:
+                route = self._pick_node_route(now)
+                if route:
+                    return route
+            k = self._pick_local_key(now)
+            if k:
+                return k
+            return self._pick_node_route(now)
+
+    def pick_node(self):
+        """Pick an online node (hub assigns keys via /next-key when node runs the request)."""
+        with self._lock:
+            return self._pick_node_route(time.time())
+
+    def report_error(self, kid, code=429):
+        with self._lock:
+            k = self.keys.get(kid)
+            if not k:
+                return
+            k["errors"] = float(k.get("errors", 0)) + 1.0
+            e = k["errors"]
+            if code == 429:
+                backoff = min(30 * (2 ** min(int(e) - 1, 2)), 120)
+            elif code in (403, 503):
+                backoff = min(30 * e, 90)
+            else:
+                backoff = min(300 * (2 ** min(int(e) - 1, 4)), 3600)
+            k["cool_until"] = time.time() + backoff
+            # No permadeath. Cool, but never dead. Decay + prober bring it back.
+            self._save()
+
+    def report_ok(self, kid):
+        with self._lock:
+            k = self.keys.get(kid)
+            if k:
+                k["errors"] = max(0.0, float(k.get("errors", 0)) - 1.0)
+                if k["errors"] < 0.5:
+                    k["errors"] = 0.0
+                    k["cool_until"] = 0
+                    k["active"] = True
+                self._save()
+
+    def decay(self):
+        """Halve error counters on a half-life schedule; resurrect any permadead key."""
+        factor = 0.5 ** (DECAY_INTERVAL / DECAY_HALFLIFE)
+        with self._lock:
+            for k in self.keys.values():
+                k["errors"] = float(k.get("errors", 0)) * factor
+                if k["errors"] < 0.05:
+                    k["errors"] = 0.0
+                if not k.get("active", True) and k["errors"] < 5:
+                    k["active"] = True
+            self._save()
+
+    def cool_capable_keys(self):
+        """Snapshot of (kid, value-dict) for keys currently cool but capable — probe targets."""
+        with self._lock:
+            now = time.time()
+            return [(kid, dict(k)) for kid, k in self.keys.items()
+                    if self._can_serve(k) and k["cool_until"] > now]
+
+    def list_keys(self):
+        with self._lock:
+            now = time.time()
+            return {kid: {k: v for k, v in kv.items() if k != "key"} | {
+                "cool": kv["cool_until"] > now,
+                "cool_remaining": max(0, int(kv["cool_until"] - now)),
+                "errors": round(float(kv.get("errors", 0)), 2),
+            } for kid, kv in self.keys.items()}
+
+    def stats(self):
+        with self._lock:
+            now = time.time()
+            active = sum(1 for v in self.keys.values() if v["active"] and v["cool_until"] < now and self._can_serve(v))
+            cool = sum(1 for v in self.keys.values() if v["cool_until"] >= now)
+            dead = sum(1 for v in self.keys.values() if not v["active"])
+            return {"total": len(self.keys), "active": active, "cool": cool, "dead": dead}
+
+    def register_node(self, name, ip, device="unknown", key=None, proxy_url=None, node_id=None):
+        with self._lock:
+            if node_id and node_id in self.nodes:
+                nid = node_id
+                n = self.nodes[nid]
+                n.update({"name": name, "ip": ip, "device": device, "seen": time.time(),
+                          "proxy_url": proxy_url or n.get("proxy_url") or f"http://{ip}:{NODE_PORT}"})
+                if key:
+                    n["key"] = key
+            elif node_id:
+                # Re-adopt a pruned node id (same device reconnecting)
+                nid = node_id
+                self.nodes[nid] = {
+                    "name": name, "ip": ip, "device": device, "seen": time.time(),
+                    "proxy_url": proxy_url or f"http://{ip}:{NODE_PORT}",
+                }
+                if key:
+                    self.nodes[nid]["key"] = key
+            else:
+                nid = str(uuid.uuid4())[:8]
+                self.nodes[nid] = {
+                    "name": name, "ip": ip, "device": device, "seen": time.time(),
+                    "proxy_url": proxy_url or f"http://{ip}:{NODE_PORT}",
+                }
+                if key:
+                    self.nodes[nid]["key"] = key
+            self._save()
+        return nid
+
+    def active_node_count(self):
+        with self._lock:
+            return len(self._online_nodes())
+
+    def heartbeat(self, nid):
+        with self._lock:
+            if nid in self.nodes:
+                self.nodes[nid]["seen"] = time.time()
+                self._save()
+
+    def list_nodes(self):
+        with self._lock:
+            now = time.time()
+            return {nid: {"name": n.get("name", "?"), "ip": n.get("ip", "?"),
+                          "device": n.get("device", "?"),
+                          "online": now - n.get("seen", 0) < 60}
+                    for nid, n in self.nodes.items()}
+
+    def remove_node(self, nid):
+        with self._lock:
+            if nid in self.nodes:
+                del self.nodes[nid]
+                self._save()
+                return True
+        return False
+
+    def prune(self, timeout=90):
+        with self._lock:
+            now = time.time()
+            dead = [nid for nid, n in self.nodes.items() if now - n.get("seen", 0) > timeout]
+            for nid in dead:
+                del self.nodes[nid]
+            if dead:
+                self._save()
+
+
+class WorkQueue:
+    """Assign chat requests to nodes that poll the hub (works through NAT)."""
+
+    def __init__(self):
+        self._pending = {}
         self._lock = threading.Lock()
 
-    def dispatch(self, body: dict, nid: str, timeout: int = WORK_TIMEOUT) -> dict | None:
+    def dispatch(self, body, nid, timeout=WORK_TIMEOUT):
         req_id = str(uuid.uuid4())[:12]
         evt = threading.Event()
         with self._lock:
@@ -604,9 +525,10 @@ class WorkQueue:
                 self._pending.pop(req_id, None)
             return None
         with self._lock:
-            return self._pending.pop(req_id, None)
+            item = self._pending.pop(req_id, None)
+        return item
 
-    def poll(self, nid: str) -> dict | None:
+    def poll(self, nid):
         with self._lock:
             for req_id, item in self._pending.items():
                 if item["nid"] == nid and not item["claimed"]:
@@ -614,8 +536,7 @@ class WorkQueue:
                     return {"request_id": req_id, "body": item["body"]}
         return None
 
-    def complete(self, req_id: str, status: int, result,
-                 headers: dict | None = None) -> bool:
+    def complete(self, req_id, status, result, headers=None):
         with self._lock:
             item = self._pending.get(req_id)
             if not item:
@@ -626,68 +547,37 @@ class WorkQueue:
             item["event"].set()
         return True
 
-    def cancel_for_node(self, nid: str):
+    def cancel_for_node(self, nid):
         with self._lock:
-            for item in self._pending.values():
-                if item["nid"] == nid and not item["event"].is_set():
-                    item["status"] = 503
-                    item["result"] = json.dumps({"error": "node offline"}).encode()
-                    item["headers"] = {"Content-Type": "application/json"}
-                    item["event"].set()
+            dead = [rid for rid, item in self._pending.items() if item["nid"] == nid]
+            for rid in dead:
+                item = self._pending.pop(rid)
+                item["event"].set()
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  HUB
-# ═══════════════════════════════════════════════════════════════════════
+# ─── Hub HTTP Server ─────────────────────────────────────────────────
 
 def run_hub():
-    storage = Storage(DATA_FILE)
-    storage.migrate_json("zenpool-data.json")
-    pool = KeyPool(storage)
+    pool = KeyPool()
     work_queue = WorkQueue()
-    conn_cache = ConnectionCache()
-    global _work_queue_for_shutdown
-    _work_queue_for_shutdown = work_queue
 
     class HubHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             pass
 
-        def _s(self, data, code: int = 200):
+        def _s(self, data, code=200):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
 
-        def _e(self, msg: str, code: int = 400):
+        def _e(self, msg, code=400):
             self._s({"error": msg}, code)
 
-        def _auth(self) -> bool:
-            if not AUTH_SECRET or not REQUIRE_AUTH:
-                return True
-            if self.headers.get("Authorization", "") == f"Bearer {AUTH_SECRET}":
-                return True
-            self._e("unauthorized", 401)
-            return False
-
-        def _node_auth(self, nid: str | None, token: str) -> bool:
-            if not nid or not AUTH_SECRET:
-                return True
-            if pool.verify_node(nid, token):
-                return True
-            self._e("invalid node token", 403)
-            return False
-
-        def _body(self) -> dict | None:
-            try:
-                n = int(self.headers.get("Content-Length", "0"))
-            except (ValueError, TypeError):
-                n = 0
-            if n > MAX_BODY:
-                self._e("request body too large", 413)
-                return None
-            return json.loads(self.rfile.read(min(n, MAX_BODY))) if n else {}
+        def _body(self):
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n)) if n else {}
 
         def do_OPTIONS(self):
             self.send_response(204)
@@ -696,94 +586,109 @@ def run_hub():
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.end_headers()
 
+        def _is_local(self):
+            # Direct connection must be local AND no upstream forwarded headers present.
+            ip = self.client_address[0]
+            if ip not in ("127.0.0.1", "::1", "localhost"):
+                return False
+            real_ip = self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For")
+            if real_ip:
+                first = real_ip.split(",")[0].strip()
+                return first in ("127.0.0.1", "::1", "localhost", "")
+            return True
+
+        def _admin_guard(self):
+            if ADMIN_LOCAL_ONLY and not self._is_local():
+                self._e("admin endpoint: localhost only", 403)
+                return False
+            return True
+
         def do_GET(self):
             p = self.path.split("?")[0]
             if p == "/health":
-                nodes = storage.get_online_nodes()
-                self._s({
-                    "ok": True, "version": VERSION, "host": platform.node(),
-                    "keys": storage.key_count(),
-                    "online_nodes": len(nodes),
-                    "total_in_flight": sum(n.get("in_flight", 0) for n in nodes),
-                    "total_tokens_proxied": sum(n.get("tokens_proxied", 0) for n in nodes),
-                })
+                now = time.time()
+                online = sum(1 for n in pool.nodes.values() if now - n.get("seen", 0) < 120)
+                st = pool.stats()
+                ready = st["active"] > 0 or online > 0
+                self._s({"ok": True, "ready": ready, "host": platform.node(),
+                         "model": GATEWAY_MODEL,
+                         "keys": st, "online_nodes": online, "nodes": len(pool.nodes)})
             elif p == "/v1/models":
                 self._s({"object": "list", "data": [
-                    {"id": "big-pickle", "object": "model", "owned_by": "opencode"},
-                    {"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "opencode"},
-                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "opencode"},
-                    {"id": "nemotron-3-super-free", "object": "model", "owned_by": "opencode"},
-                    {"id": "mimo-v2.5-free", "object": "model", "owned_by": "opencode"},
+                    {"id": GATEWAY_MODEL, "object": "model", "owned_by": "zenpool"},
                 ]})
+            elif p == "/zenpool.py":
+                try:
+                    with open(SELF_PATH, "rb") as f:
+                        body = f.read()
+                except OSError as e:
+                    return self._e(f"cannot read self: {e}", 500)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/x-python; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(body)
+            elif p in ("/install.sh", "/install.ps1"):
+                hub_url = self.headers.get("X-Forwarded-Host")
+                if hub_url:
+                    proto = self.headers.get("X-Forwarded-Proto", "http")
+                    hub_url = f"{proto}://{hub_url}"
+                else:
+                    host = self.headers.get("Host") or f"localhost:{HUB_PORT}"
+                    hub_url = f"http://{host}"
+                if p == "/install.sh":
+                    body = INSTALL_SH.replace("__HUB_URL__", hub_url).encode()
+                    ctype = "text/x-shellscript; charset=utf-8"
+                else:
+                    body = INSTALL_PS1.replace("__HUB_URL__", hub_url).encode()
+                    ctype = "text/plain; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(body)
             elif p == "/keys":
-                if not self._auth():
+                if not self._admin_guard():
                     return
                 self._s({"keys": pool.list_keys()})
             elif p == "/nodes":
-                if not self._auth():
+                if not self._admin_guard():
                     return
                 self._s({"nodes": pool.list_nodes()})
-            elif p == "/metrics":
-                self._metrics()
-            elif p == "/status":
-                self._status()
             else:
                 self._e("not found", 404)
 
         def do_POST(self):
             p = self.path.split("?")[0]
-
-            # /register and proxy are open; everything else requires auth
-            if p not in ("/register", "/v1/chat/completions",
-                         "/heartbeat", "/poll-work", "/complete-work"):
-                if not self._auth():
-                    return
-
             try:
                 b = self._body()
-                if b is None:
-                    return
             except Exception:
                 return self._e("bad json")
-
             if p == "/keys":
+                if not self._admin_guard():
+                    return
                 if not b.get("key"):
                     return self._e("missing key")
-                kid = pool.add_key(b["key"], b.get("label", ""))
+                kid = pool.add_key(b["key"], b.get("label", ""), tier=b.get("tier", "pro"))
                 self._s({"id": kid})
-
             elif p == "/register":
-                proxy_url = b.get("proxy_url", "")
-                valid, _ = validate_proxy_url(proxy_url)
-                if not valid:
-                    proxy_url = f"http://{self.client_address[0]}:{NODE_PORT}"
-                nid, token = pool.register_node(
-                    b.get("name", f"node-{storage.node_count()+1}"),
+                nid = pool.register_node(
+                    b.get("name", f"n-{len(pool.nodes)+1}"),
                     self.client_address[0],
-                    b.get("device", "unknown"),
-                    proxy_url,
+                    b.get("device"),
                     key=b.get("key"),
+                    proxy_url=b.get("proxy_url"),
                     node_id=b.get("node_id"),
                 )
-                self._s({"node_id": nid, "token": token, "interval": HEARTBEAT_INTERVAL})
-
+                self._s({"node_id": nid, "interval": HEARTBEAT_INTERVAL})
             elif p == "/heartbeat":
-                nid = b.get("node_id")
-                if not self._node_auth(nid, b.get("token", "")):
-                    return
-                pool.heartbeat(nid,
-                               in_flight=b.get("in_flight", 0),
-                               uptime=b.get("uptime", 0),
-                               tokens_proxied=b.get("tokens_proxied", 0),
-                               public_ip=b.get("public_ip", ""))
+                pool.heartbeat(b.get("node_id"))
                 self._s({"ok": True})
-
             elif p == "/poll-work":
-                nid = b.get("node_id")
-                if not self._node_auth(nid, b.get("token", "")):
-                    return
-                self._s(work_queue.poll(nid) or {"work": None})
-
+                work = work_queue.poll(b.get("node_id"))
+                self._s(work or {"work": None})
             elif p == "/complete-work":
                 raw = b.get("body", "")
                 if isinstance(raw, str):
@@ -793,46 +698,39 @@ def run_hub():
                 ok = work_queue.complete(
                     b.get("request_id"), b.get("status", 502), raw, b.get("headers"))
                 self._s({"ok": ok})
-
             elif p == "/next-key":
                 nid = b.get("node_id")
                 if not nid or not pool.node_online(nid):
                     return self._e("unknown or offline node", 403)
-                if not self._node_auth(nid, b.get("token", "")):
-                    return
                 k = pool.get_key_for_node()
-                self._s(k if k else {"error": "no keys available"}, 200 if k else 503)
-
+                if k:
+                    self._s(k)
+                else:
+                    self._s({"error": "no keys available"}, 503)
             elif p == "/report":
+                ok = b.get("ok", True)
                 kid = b.get("key_id")
-                if b.get("ok", True):
+                if ok:
                     pool.report_ok(kid)
                 else:
                     pool.report_error(kid)
                 self._s({"ok": True})
-
-            elif p.startswith("/keys/") and p.endswith("/reactivate"):
-                kid = p.split("/")[2]
-                k = storage.get_key(kid)
-                if not k:
-                    return self._e("key not found", 404)
-                storage.update_key(kid, active=1, errors=0, cool_until=0)
-                self._s({"ok": True})
-
             elif p == "/v1/chat/completions":
-                self._proxy(b)
-
+                b["model"] = GATEWAY_MODEL  # gateway identity — caller cannot override
+                self._proxy(b, pool)
             else:
                 self._e("not found", 404)
 
         def do_DELETE(self):
-            if not self._auth():
-                return
             p = self.path.split("?")[0]
             if p.startswith("/keys/"):
+                if not self._admin_guard():
+                    return
                 pool.remove_key(p.split("/")[-1])
                 self._s({"ok": True})
             elif p.startswith("/nodes/"):
+                if not self._admin_guard():
+                    return
                 ok = pool.remove_node(p.split("/")[-1])
                 self._s({"ok": ok}, 200 if ok else 404)
             else:
@@ -854,24 +752,20 @@ def run_hub():
             else:
                 self.wfile.write(r.read())
 
-        def _forward_to_node(self, body: dict, k: dict, timeout: int = PUSH_TIMEOUT):
-            proxy_url = k["proxy_url"]
-            valid, err = validate_proxy_url(proxy_url)
-            if not valid:
-                raise ValueError(f"SSRF blocked: {err}")
-            url = f"{proxy_url.rstrip('/')}/v1/chat/completions"
-            parsed = urllib.parse.urlparse(url)
-            host = parsed.hostname or "localhost"
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        def _forward_to_node(self, body, k, timeout=PUSH_TIMEOUT):
+            """Route request through the node proxy so OpenCode sees the node's IP."""
+            url = f"{k['proxy_url'].rstrip('/')}/v1/chat/completions"
             req = urllib.request.Request(
-                url, data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json",
-                         "X-ZenPool-Hub": "1", "User-Agent": "curl/7.76.1"},
+                url,
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", "X-ZenPool-Hub": "1",
+                         "User-Agent": "curl/7.76.1"},
             )
-            with conn_cache.get_opener(host, port).open(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 self._relay_response(r)
 
-        def _dispatch_via_node(self, body: dict, k: dict) -> bool:
+        def _dispatch_via_node(self, body, k):
+            """Pull work via hub queue (NAT-safe), then optional quick push."""
             item = work_queue.dispatch(body, k["nid"], timeout=PULL_TIMEOUT)
             if item:
                 self.send_response(item["status"])
@@ -895,19 +789,17 @@ def run_hub():
                 self.end_headers()
                 self.wfile.write(raw)
                 return True
-            except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+            except (urllib.error.URLError, OSError, TimeoutError):
                 return False
 
-        def _proxy(self, body: dict):
-            tried_local: set = set()
+        def _proxy(self, body, pool):
+            tried_local = set()
             node_attempts = 0
-            n_nodes = pool.active_node_count()
-            n_keys = storage.key_count()
-            max_node_attempts = max(n_nodes * 5, 5)
-            max_tries = max(n_keys + n_nodes, 1) * 3
+            max_node_attempts = max(pool.active_node_count() * 5, 5)
+            max_tries = max(len(pool.keys) + pool.active_node_count(), 1) * 3
             last_resp = None
             last_code = 503
-            prefer_node = n_nodes > 0 and not pool.peek_key()
+            prefer_node = pool.active_node_count() > 0 and not pool.get_key()
 
             for _ in range(max_tries):
                 k = pool.get_any_key(prefer_node=prefer_node)
@@ -935,32 +827,16 @@ def run_hub():
                     continue
                 tried_local.add(kid)
 
-                parsed = urllib.parse.urlparse(ZEN_API)
-                zhost = parsed.hostname or "opencode.ai"
-                zport = parsed.port or 443
                 req = urllib.request.Request(
-                    ZEN_API, data=json.dumps(body).encode(),
-                    headers={"Content-Type": "application/json",
-                             "Authorization": f"Bearer {k['key']}",
-                             "User-Agent": "curl/7.76.1"},
+                    ZEN_API,
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {k['key']}",
+                             "User-Agent": "curl/7.76.1"}
                 )
                 try:
-                    with conn_cache.get_opener(zhost, zport).open(req, timeout=120) as r:
-                        data = r.read()
-                        try:
-                            usage = json.loads(data).get("usage", {}) or {}
-                            pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
-                            if pt is not None and ct is not None:
-                                pool.report_tokens(kid, pt, ct)
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
+                    with urllib.request.urlopen(req, timeout=120) as r:
                         pool.report_ok(kid)
-                        self.send_response(r.status)
-                        self.send_header("Content-Type",
-                                          r.headers.get("Content-Type", "application/json"))
-                        self.send_header("Access-Control-Allow-Origin", "*")
-                        self.end_headers()
-                        self.wfile.write(data)
+                        self._relay_response(r)
                         return
                 except urllib.error.HTTPError as e:
                     raw = b""
@@ -968,16 +844,25 @@ def run_hub():
                         raw = e.read()
                         resp_body = json.loads(raw) if raw else {"error": f"HTTP {e.code}"}
                     except (json.JSONDecodeError, TypeError):
-                        resp_body = {"error": f"upstream {e.code}",
-                                     "detail": raw.decode(errors="replace")[:200]}
-                    last_resp, last_code = resp_body, e.code
-                    if e.code in (429, 503, 403):
-                        pool.report_error(kid, e.code)
+                        resp_body = {"error": f"upstream HTTP {e.code}", "detail": raw.decode(errors='replace')[:200]}
+                    last_resp = resp_body
+                    last_code = e.code
+                    if e.code == 429:
+                        pool.report_error(kid, 429)
                         prefer_node = pool.active_node_count() > 0
-                    elif e.code >= 500:
+                        continue
+                    if e.code == 503:
                         prefer_node = pool.active_node_count() > 0
-                    else:
-                        return self._s(resp_body, e.code)
+                        continue
+                    if e.code == 403:
+                        pool.report_error(kid, 403)
+                        prefer_node = pool.active_node_count() > 0
+                        continue
+                    if e.code >= 500:
+                        prefer_node = pool.active_node_count() > 0
+                        continue
+                    self._s(resp_body, e.code)
+                    return
                 except urllib.error.URLError as e:
                     return self._e(f"upstream unreachable: {e.reason}", 502)
                 except Exception as e:
@@ -987,101 +872,57 @@ def run_hub():
                 return self._s(last_resp, last_code)
             return self._e("no keys available", 503)
 
-        def _metrics(self):
-            now = time.time()
-            keys_raw = storage.list_keys(include_secret=False)
-            active = cooled = dead = 0
-            for kv in keys_raw.values():
-                if not kv.get("active"):
-                    dead += 1
-                elif kv.get("cool_until", 0) > now:
-                    cooled += 1
-                else:
-                    active += 1
-            lines = [
-                "# HELP zenpool_keys_total Keys by status",
-                "# TYPE zenpool_keys_total gauge",
-                f'zenpool_keys_total{{status="active"}} {active}',
-                f'zenpool_keys_total{{status="cooled"}} {cooled}',
-                f'zenpool_keys_total{{status="dead"}} {dead}',
-                "# HELP zenpool_key_errors Total errors per key",
-                "# TYPE zenpool_key_errors counter",
-            ]
-            for kid, kv in keys_raw.items():
-                label = kv.get("label", "")
-                lines.append(f'zenpool_key_errors{{key_id="{kid}",label="{label}"}} {kv["errors"]}')
-            lines += [
-                "# HELP zenpool_key_tokens_input Input tokens per key",
-                "# TYPE zenpool_key_tokens_input counter",
-            ]
-            for kid, kv in keys_raw.items():
-                lines.append(f'zenpool_key_tokens_input{{key_id="{kid}"}} {kv["tokens_input"]}')
-            lines += [
-                "# HELP zenpool_key_tokens_output Output tokens per key",
-                "# TYPE zenpool_key_tokens_output counter",
-            ]
-            for kid, kv in keys_raw.items():
-                lines.append(f'zenpool_key_tokens_output{{key_id="{kid}"}} {kv["tokens_output"]}')
-            lines += [
-                "# HELP zenpool_nodes_online Nodes currently online",
-                "# TYPE zenpool_nodes_online gauge",
-                f"zenpool_nodes_online {pool.active_node_count()}",
-                "# HELP zenpool_uptime_seconds Hub uptime",
-                "# TYPE zenpool_uptime_seconds gauge",
-                f"zenpool_uptime_seconds {int(time.time() - pool._start)}",
-            ]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; version=0.0.4")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(("\n".join(lines) + "\n").encode())
-
-        def _status(self):
-            now = time.time()
-            keys_raw = storage.list_keys(include_secret=False)
-            nodes_raw = pool.list_nodes()
-            self._s({
-                "version": VERSION,
-                "uptime": int(now - pool._start),
-                "total_requests": sum(v.get("total", 0) for v in keys_raw.values()),
-                "total_tokens": sum(
-                    v.get("tokens_input", 0) + v.get("tokens_output", 0)
-                    for v in keys_raw.values()),
-                "active_keys": sum(1 for v in keys_raw.values()
-                                    if v.get("active") and not v.get("cool")),
-                "cooled_keys": sum(1 for v in keys_raw.values() if v.get("cool")),
-                "dead_keys": sum(1 for v in keys_raw.values() if not v.get("active")),
-                "online_nodes": sum(1 for n in nodes_raw.values() if n.get("online")),
-                "total_nodes": len(nodes_raw),
-                "keys": keys_raw,
-                "nodes": nodes_raw,
-            })
-
     def _prune():
         while True:
             time.sleep(15)
-            for nid in pool.prune():
-                work_queue.cancel_for_node(nid)
+            pool.prune()
+
+    def _decay():
+        while True:
+            time.sleep(DECAY_INTERVAL)
+            try:
+                pool.decay()
+            except Exception:
+                pass
+
+    def _probe():
+        while True:
+            time.sleep(PROBE_INTERVAL)
+            for kid, k in pool.cool_capable_keys():
+                try:
+                    req = urllib.request.Request(
+                        ZEN_API, data=json.dumps(PROBE_BODY).encode(),
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": f"Bearer {k['key']}",
+                                 "User-Agent": "curl/7.76.1"})
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        if r.status < 400:
+                            pool.report_ok(kid)
+                            # force full recovery on successful probe
+                            with pool._lock:
+                                if kid in pool.keys:
+                                    pool.keys[kid]["errors"] = 0.0
+                                    pool.keys[kid]["cool_until"] = 0
+                                    pool.keys[kid]["active"] = True
+                                    pool._save()
+                except Exception:
+                    pass
 
     threading.Thread(target=_prune, daemon=True).start()
-
-    print(f"\n  🐍 ZenPool Hub v{VERSION}  —  {platform.node()}")
-    print(f"  ├─ Port:   {HUB_PORT}")
-    print(f"  ├─ Keys:   {storage.key_count()}")
-    print(f"  ├─ DB:     {os.path.abspath(DATA_FILE)}")
-    print(f"  ├─ Auth:   {'required' if AUTH_SECRET and REQUIRE_AUTH else 'open'}")
-    print("  └─ SSRF:   protected")
-    print()
-    print("  Endpoints:")
-    print("    GET  /health  /status  /metrics")
-    print("    GET  /keys    /nodes                    (auth required)")
-    print("    POST /keys    DELETE /keys/<id>")
-    print("    POST /register  /heartbeat  /next-key  /report")
-    print("    POST /poll-work  /complete-work")
-    print("    POST /keys/<id>/reactivate")
-    print("    POST /v1/chat/completions   GET /v1/models")
-    print()
-    print(f"  Nodes: curl -fsSL <url>/zenpool.py | python3 - node --hub http://<ip>:{HUB_PORT}")
+    threading.Thread(target=_decay, daemon=True).start()
+    threading.Thread(target=_probe, daemon=True).start()
+    st = pool.stats()
+    print(f"\n  🥒 ZenPool Gateway v{VERSION}  —  model={GATEWAY_MODEL}  host={platform.node()}")
+    print(f"  ├─ Port:  {HUB_PORT}  (admin endpoints: localhost-only)")
+    print(f"  ├─ Keys:  total={st['total']} active={st['active']} cool={st['cool']} dead={st['dead']}")
+    print(f"  └─ Data:  {os.path.abspath(DATA_FILE)}")
+    print("\n  Public:")
+    print("    GET  /health           gateway readiness")
+    print("    GET  /v1/models        → [big-pickle]")
+    print("    POST /v1/chat/completions  (model forced to big-pickle)")
+    print("  Admin (localhost-only):")
+    print("    GET  /keys  POST /keys  DELETE /keys/<id>")
+    print("    GET  /nodes  DELETE /nodes/<id>")
     print()
     ThreadingHTTPServer(("0.0.0.0", HUB_PORT), HubHandler).serve_forever()
 
@@ -1091,62 +932,47 @@ def run_hub():
 # ═══════════════════════════════════════════════════════════════════════
 
 class NodeClient:
-    def __init__(self, hub: str, local_key: str | None = None,
-                 proxy_url: str | None = None, state_dir: str | None = None,
-                 max_workers: int = 0):
+    def __init__(self, hub, local_key=None, proxy_url=None, state_dir=None):
         self.hub = hub.rstrip("/")
         self.local_key = local_key
         self.proxy_url = proxy_url or os.environ.get("ZENPOOL_PUBLIC_URL")
-        self.max_workers = max_workers or int(os.environ.get("ZENPOOL_NODE_MAX_WORKERS", "8"))
-        self._work_semaphore = threading.BoundedSemaphore(self.max_workers)
-        self.state_dir = state_dir or os.environ.get("ZENPOOL_STATE", _default_state_dir())
+        self.state_dir = state_dir or os.environ.get(
+            "ZENPOOL_STATE", os.path.join(os.path.expanduser("~"), ".local", "share", "zenpool"))
         self.state_file = os.path.join(self.state_dir, "node-state.json")
-        self.nid, self.token = self._load_state()
+        self.nid = self._load_nid()
         self.hub_ok = False
         self.name = platform.node() or "unknown"
         self.device = f"{platform.system()}/{platform.machine()}"
-        self._conn_cache = ConnectionCache()
-        self.start_time = time.time()
-        self._in_flight = 0
-        self._in_flight_lock = threading.Lock()
-        self.tokens_proxied = 0
-        self.public_ip = "unknown"
 
-    def _load_state(self) -> tuple[str | None, str | None]:
+    def _load_nid(self):
         try:
             with open(self.state_file) as f:
-                d = json.load(f)
-                return d.get("node_id"), d.get("token")
+                return json.load(f).get("node_id")
         except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return None, None
+            return None
 
-    def _save_state(self):
+    def _save_nid(self):
         try:
             os.makedirs(self.state_dir, exist_ok=True)
             with open(self.state_file, "w") as f:
-                json.dump({"node_id": self.nid, "token": self.token,
-                           "hub": self.hub, "public_ip": self.public_ip}, f)
+                json.dump({"node_id": self.nid, "hub": self.hub}, f)
         except OSError:
             pass
 
-    def _call(self, path: str, data: dict | None = None) -> dict:
+    def _call(self, path, data=None):
         body = json.dumps(data).encode() if data else None
         try:
-            parsed = urllib.parse.urlparse(self.hub)
-            host = parsed.hostname or "localhost"
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            r = self._conn_cache.get_opener(host, port).open(
-                urllib.request.Request(
-                    f"{self.hub}{path}", data=body,
-                    headers={"Content-Type": "application/json"}),
-                timeout=10,
+            r = urllib.request.urlopen(
+                urllib.request.Request(f"{self.hub}{path}", data=body,
+                                       headers={"Content-Type": "application/json"}),
+                timeout=10
             )
             return json.loads(r.read())
         except Exception as e:
             return {"error": str(e)}
 
-    def register(self) -> bool:
-        payload: dict = {"name": self.name, "device": self.device}
+    def register(self):
+        payload = {"name": self.name, "device": self.device}
         if self.nid:
             payload["node_id"] = self.nid
         if self.local_key:
@@ -1156,113 +982,83 @@ class NodeClient:
         r = self._call("/register", payload)
         if r.get("node_id"):
             self.nid = r["node_id"]
-            self.token = r.get("token", "")
             self.hub_ok = True
-            self._save_state()
+            self._save_nid()
             return True
         self.hub_ok = False
         return False
 
     def heartbeat(self):
-        with self._in_flight_lock:
-            in_flight = self._in_flight
-        r = self._call("/heartbeat", {
-            "node_id": self.nid, "token": self.token or "",
-            "in_flight": in_flight,
-            "uptime": int(time.time() - self.start_time),
-            "tokens_proxied": self.tokens_proxied,
-            "public_ip": self.public_ip,
-        })
+        r = self._call("/heartbeat", {"node_id": self.nid})
         self.hub_ok = bool(r.get("ok")) and not r.get("error")
 
-    def poll_work(self) -> dict:
-        return self._call("/poll-work", {"node_id": self.nid, "token": self.token or ""})
+    def poll_work(self):
+        return self._call("/poll-work", {"node_id": self.nid})
 
-    def complete_work(self, request_id: str, status: int, body,
-                      headers: dict | None = None):
-        self._call("/complete-work", {
-            "request_id": request_id, "status": status,
+    def complete_work(self, request_id, status, body, headers=None):
+        payload = {
+            "request_id": request_id,
+            "status": status,
             "body": body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body,
             "headers": headers or {},
-        })
+        }
+        self._call("/complete-work", payload)
 
-    def next_key(self) -> dict | None:
-        r = self._call("/next-key", {"node_id": self.nid, "token": self.token or ""})
+    def run_hub_work(self, work):
+        """Execute a hub-assigned request from this node's IP using a hub pool key."""
+        body = work.get("body")
+        req_id = work.get("request_id")
+        if not body or not req_id:
+            return
+        key = {"key": self.local_key, "id": None} if self.local_key else self.next_key()
+        if not key or not key.get("key"):
+            self.complete_work(req_id, 503, json.dumps({"error": "no keys available"}),
+                               {"Content-Type": "application/json"})
+            return
+        headers = {"Content-Type": "application/json", "User-Agent": "curl/7.76.1",
+                   "Authorization": f"Bearer {key['key']}"}
+        req = urllib.request.Request(ZEN_API, data=json.dumps(body).encode(), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=WORK_TIMEOUT) as r:
+                data = r.read()
+                if key.get("id"):
+                    self.report(key["id"], ok=True)
+                self.complete_work(req_id, r.status, data,
+                                   {"Content-Type": r.headers.get("Content-Type", "application/json")})
+        except urllib.error.HTTPError as e:
+            if key.get("id"):
+                self.report(key["id"], ok=False)
+            self.complete_work(req_id, e.code, e.read(), {"Content-Type": "application/json"})
+        except Exception as e:
+            self.complete_work(req_id, 502, json.dumps({"error": str(e)}),
+                               {"Content-Type": "application/json"})
+
+    def next_key(self):
+        r = self._call("/next-key", {"node_id": self.nid})
         return r if r.get("key") else None
 
-    def report(self, kid: str, ok: bool = True):
+    def report(self, kid, ok=True):
         self._call("/report", {"key_id": kid, "ok": ok, "node_id": self.nid})
 
-    def run_hub_work(self, work: dict):
-        with self._in_flight_lock:
-            self._in_flight += 1
-        try:
-            body = work.get("body")
-            req_id = work.get("request_id")
-            if not body or not req_id:
-                return
-            key = {"key": self.local_key, "id": None} if self.local_key else self.next_key()
-            if not key or not key.get("key"):
-                self.complete_work(req_id, 503,
-                                   json.dumps({"error": "no keys available"}),
-                                   {"Content-Type": "application/json"})
-                return
-            parsed = urllib.parse.urlparse(ZEN_API)
-            req = urllib.request.Request(
-                ZEN_API, data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json",
-                         "User-Agent": "curl/7.76.1",
-                         "Authorization": f"Bearer {key['key']}"},
-            )
-            try:
-                with self._conn_cache.get_opener(
-                        parsed.hostname, parsed.port or 443).open(req, timeout=WORK_TIMEOUT) as r:
-                    data = r.read()
-                    try:
-                        tt = ((json.loads(data).get("usage") or {})
-                              .get("total_tokens", 0) or 0)
-                        self.tokens_proxied += tt
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-                    if key.get("id"):
-                        self.report(key["id"], ok=True)
-                    self.complete_work(req_id, r.status, data,
-                                       {"Content-Type": r.headers.get(
-                                           "Content-Type", "application/json")})
-            except urllib.error.HTTPError as e:
-                if key.get("id"):
-                    self.report(key["id"], ok=False)
-                self.complete_work(req_id, e.code, e.read(),
-                                   {"Content-Type": "application/json"})
-            except Exception as e:
-                self.complete_work(req_id, 502,
-                                   json.dumps({"error": str(e)}),
-                                   {"Content-Type": "application/json"})
-        finally:
-            with self._in_flight_lock:
-                self._in_flight -= 1
-            self._work_semaphore.release()
 
-
-def run_node(hub_url: str, local_key: str | None = None,
-             proxy_url: str | None = None):
+def run_node(hub_url, local_key=None, proxy_url=None):
     client = NodeClient(hub_url, local_key=local_key, proxy_url=proxy_url)
 
     class NodeHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             pass
 
-        def _s(self, data, code: int = 200):
+        def _s(self, data, code=200):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
 
-        def _e(self, msg: str, code: int = 400):
+        def _e(self, msg, code=400):
             self._s({"error": msg}, code)
 
-        def _body(self) -> dict:
+        def _body(self):
             n = int(self.headers.get("Content-Length", 0))
             return json.loads(self.rfile.read(n)) if n else {}
 
@@ -1276,15 +1072,9 @@ def run_node(hub_url: str, local_key: str | None = None,
         def do_GET(self):
             p = self.path.split("?")[0]
             if p == "/health":
-                self._s({
-                    "ok": True, "node": client.nid, "hub": client.hub,
-                    "registered": client.hub_ok, "version": VERSION,
-                    "public_ip": client.public_ip,
-                    "uptime": int(time.time() - client.start_time),
-                    "in_flight": client._in_flight,
-                    "tokens_proxied": client.tokens_proxied,
-                })
-            elif p in ("/models", "/v1/models"):
+                self._s({"ok": True, "node": client.nid, "hub": client.hub,
+                         "registered": client.hub_ok})
+            elif p == "/models":
                 self._s({"object": "list", "data": [
                     {"id": "deepseek-v4-flash-free"}, {"id": "nemotron-3-super-free"},
                     {"id": "mimo-v2.5-free"}, {"id": "big-pickle"},
@@ -1303,38 +1093,32 @@ def run_node(hub_url: str, local_key: str | None = None,
             else:
                 self._e("not found", 404)
 
-        def _proxy(self, body: dict):
-            key = ({"key": client.local_key, "id": None}
-                   if client.local_key else client.next_key())
+        def _proxy(self, body):
+            # Use local key if set, otherwise ask the hub
+            if client.local_key:
+                key = {"key": client.local_key, "id": None}
+            else:
+                key = client.next_key()
             headers = {"Content-Type": "application/json", "User-Agent": "curl/7.76.1"}
             if key:
                 headers["Authorization"] = f"Bearer {key['key']}"
-            parsed = urllib.parse.urlparse(ZEN_API)
-            zhost = parsed.hostname or "opencode.ai"
-            zport = parsed.port or 443
-            req = urllib.request.Request(ZEN_API, data=json.dumps(body).encode(),
-                                          headers=headers)
-            with client._in_flight_lock:
-                client._in_flight += 1
+            req = urllib.request.Request(
+                ZEN_API, data=json.dumps(body).encode(), headers=headers
+            )
             try:
-                with client._conn_cache.get_opener(zhost, zport).open(req, timeout=180) as r:
+                with urllib.request.urlopen(req, timeout=180) as r:
                     data = r.read()
-                    try:
-                        tt = ((json.loads(data).get("usage") or {})
-                              .get("total_tokens", 0) or 0)
-                        client.tokens_proxied += tt
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-                    if key and key.get("id"):
+                    if key and key["id"]:
                         client.report(key["id"], ok=True)
-                    self.send_response(r.status)
-                    self.send_header("Content-Type",
-                                      r.headers.get("Content-Type", "application/json"))
+                    status = r.status
+                    ctype = r.headers.get("Content-Type", "application/json")
+                    self.send_response(status)
+                    self.send_header("Content-Type", ctype)
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     self.wfile.write(data)
             except urllib.error.HTTPError as e:
-                if key and key.get("id"):
+                if key and key["id"]:
                     client.report(key["id"], ok=False)
                 raw = e.read()
                 self.send_response(e.code)
@@ -1344,66 +1128,51 @@ def run_node(hub_url: str, local_key: str | None = None,
                 self.wfile.write(raw)
             except Exception as e:
                 self._e(str(e), 502)
-            finally:
-                with client._in_flight_lock:
-                    client._in_flight -= 1
 
+    # Register + heartbeat + poll hub for work (NAT-safe)
     def _loop():
         while True:
             if not client.nid or not client.hub_ok:
                 if client.register():
-                    print(f"  ✅ Registered with hub: {client.nid}")
+                    print(f"  ✅ Connected to hub: {client.nid}")
                 elif client.nid:
-                    print(f"  ⚠️  Hub unreachable — retrying (id: {client.nid})")
+                    print(f"  ⚠️  Hub unreachable — retrying (cached id: {client.nid})")
             else:
                 client.heartbeat()
             time.sleep(HEARTBEAT_INTERVAL)
 
     def _poll_loop():
         while True:
-            if client.nid and client.hub_ok:
+            if client.nid:
                 work = client.poll_work()
                 if work and work.get("request_id"):
-                    client._work_semaphore.acquire()
-                    threading.Thread(target=client.run_hub_work,
-                                     args=(work,), daemon=True).start()
+                    threading.Thread(target=client.run_hub_work, args=(work,), daemon=True).start()
             time.sleep(POLL_INTERVAL)
 
-    def _ip_loop():
-        while True:
-            try:
-                with urllib.request.urlopen(
-                    urllib.request.Request("http://checkip.amazonaws.com"),
-                    timeout=5,
-                ) as r:
-                    client.public_ip = r.read().decode().strip()
-                client._save_state()
-            except Exception:
-                pass
-            time.sleep(15)
-
     print(f"\n  🐍 ZenPool Node v{VERSION}  —  {client.name}")
-    print(f"  ├─ Hub:     {client.hub}")
-    print(f"  ├─ Port:    {NODE_PORT}")
-    print(f"  ├─ Workers: {client.max_workers}")
-    print(f"  ├─ Device:  {client.device}")
-    print(f"  └─ State:   {client.state_dir}")
+    print(f"  ├─ Hub: {client.hub}")
+    print(f"  ├─ Port: {NODE_PORT}")
+    print(f"  └─ Device: {client.device}")
     print()
-
     client.register()
     threading.Thread(target=_loop, daemon=True).start()
     threading.Thread(target=_poll_loop, daemon=True).start()
-    threading.Thread(target=_ip_loop, daemon=True).start()
 
-    print(f"  🚀 Hub:   {client.hub}/v1/chat/completions")
-    print(f"  📡 Local: http://localhost:{NODE_PORT}/v1/chat/completions")
+    print(f"  🚀 Hub endpoint: {client.hub}/v1/chat/completions")
+    print(f"  🔄 Auto-registers; pulls keys from hub when running requests")
+    print(f"  📡 Local proxy: http://localhost:{NODE_PORT}/v1/chat/completions")
     print()
     try:
         ThreadingHTTPServer(("0.0.0.0", NODE_PORT), NodeHandler).serve_forever()
     except OSError as e:
-        if e.errno == 98 or "Address already in use" in str(e):
-            print(f"  ❌ Port {NODE_PORT} in use — another node is running.")
-            print("     Stop it: pkill -u \"$(id -u)\" -f 'zenpool.py.*node'")
+        if e.errno == 98 or "Address already in use" in str(e) or getattr(e, 'winerror', 0) in (10048, 10013):
+            print(f"  ❌ Port {NODE_PORT} already in use — another zenpool node is running.")
+            if platform.system() == "Windows":
+                print(f"     Find it:  netstat -ano | findstr :{NODE_PORT}")
+                print(f"     Stop it:  taskkill /PID <pid> /F")
+            else:
+                print(f"     Stop it:  pkill -u \"$(id -u)\" -f 'zenpool.py.*node'")
+            print(f"     Or check: curl -s http://localhost:{NODE_PORT}/health")
             raise SystemExit(1) from e
         raise
 
@@ -1415,31 +1184,22 @@ def run_node(hub_url: str, local_key: str | None = None,
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(
-        prog="zenpool",
-        description=(
-            "ZenPool — distributed API key pool for OpenCode Zen\n"
-            "  Linux/Mac:  curl -fsSL <url>/zenpool.py | python3 - node\n"
-            "  PowerShell: (Invoke-WebRequest -Uri <url>/zenpool.py).Content | python - node"
-        ),
-    )
-    p.add_argument("mode", choices=["hub", "node"])
-    p.add_argument("--hub", default=DEFAULT_HUB,
-                   help=f"hub URL for node mode (default: {DEFAULT_HUB})")
-    p.add_argument("--key", default=None,
-                   help="donate a local API key to the hub pool")
+    p = argparse.ArgumentParser(prog="zenpool", description="ZenPool — distributed key proxy for OpenCode")
+    p.add_argument("mode", choices=["hub", "node"], help="run as hub (server) or node (agent)")
+    p.add_argument("--hub", default=DEFAULT_HUB, help="hub URL (for node mode, default: " + DEFAULT_HUB + ")")
+    p.add_argument("--key", default=None, help="optional local key override (default: keys from hub pool)")
     p.add_argument("--public-url", default=None,
-                   help="reachable URL for this node (e.g. http://100.x.x.x:5052 for Tailscale)")
+                   help="reachable URL for this node proxy (e.g. http://100.x.x.x:5052 for Tailscale)")
 
     args = p.parse_args()
 
     print(r"""
-          ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-          ██ ▄▄ █ ▄▄▀█ ▄▄▀█ ▄▄▀█ ▄▄▄█▄ ▄▄▄██
-          ██ █  █ ▀▀ █ ▀▀ █ ▀▀ █ █▀▀██ █ ███
-          ██ █▄▄█ ██▄▀▄██▄▀▄██▄▀▄▄▄▄██ █ ███
-          ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-          """)
+            ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+            ██ ▄▄ █ ▄▄▀█ ▄▄▀█ ▄▄▀█ ▄▄▄█▄ ▄▄▄██
+            ██ █  █ ▀▀ █ ▀▀ █ ▀▀ █ █▀▀██ █ ███
+            ██ █▄▄█ ██▄▀▄██▄▀▄██▄▀▄▄▄▄██ █ ███
+            ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+            """)
 
     if args.mode == "hub":
         run_hub()

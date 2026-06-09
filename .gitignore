@@ -1,5 +1,8 @@
-node_modules/
-*.pyc
 __pycache__/
+*.pyc
+*.bak.*
+node_modules/
 .env
 zenpool-data.json
+*.log
+/tmp/
